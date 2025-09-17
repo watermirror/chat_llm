@@ -1,0 +1,32 @@
+#!/bin/bash
+
+# Check if parameter is provided
+if [ $# -eq 0 ]; then
+    echo "Usage: ./config <config_name>"
+    echo "Example: ./config deepseek"
+    exit 1
+fi
+
+CONFIG_NAME="$1"
+SOURCE_FILE="configs/config.toml.$CONFIG_NAME"
+TARGET_DIR="$HOME/.config/chat-cli"
+TARGET_FILE="$TARGET_DIR/config.toml"
+
+# Check if source file exists
+if [ ! -f "$SOURCE_FILE" ]; then
+    echo "Error: Configuration file '$SOURCE_FILE' not found"
+    exit 1
+fi
+
+# Create target directory if it doesn't exist
+mkdir -p "$TARGET_DIR"
+
+# Copy the configuration file
+cp "$SOURCE_FILE" "$TARGET_FILE"
+
+if [ $? -eq 0 ]; then
+    echo "Configuration '$CONFIG_NAME' copied to $TARGET_FILE"
+else
+    echo "Error: Failed to copy configuration file"
+    exit 1
+fi

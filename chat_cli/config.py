@@ -14,8 +14,8 @@ except ModuleNotFoundError:  # pragma: no cover
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "chat-cli" / "config.toml"
 LOCAL_FALLBACK_CONFIG_PATH = Path.cwd() / ".chat-cli" / "config.toml"
-PACKAGE_ROOT = Path(__file__).resolve().parent
-DEFAULT_TEMPLATE_PATH = PACKAGE_ROOT / "default_config.toml"
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_TEMPLATE_PATH = PACKAGE_ROOT / "configs" / "default_config.toml"
 
 
 class ConfigError(Exception):
