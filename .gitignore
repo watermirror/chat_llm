@@ -205,3 +205,9 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+**/config.toml.deepseek
+**/config.toml.openai
+**/default_config.toml
+.idea/
+get_current_time.year
