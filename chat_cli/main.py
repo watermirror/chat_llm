@@ -25,6 +25,7 @@ def style(text: str, color: str, enable: bool) -> str:
 
 
 EXIT_COMMANDS = {"/quit", "/exit", "/q"}
+LAST_LOG_PATH = Path(__file__).resolve().parent.parent / "last_log.json"
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
@@ -48,83 +49,86 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
+    session = ChatSession()
     args = parse_args(argv)
 
-    config_path = args.config if args.config else None
     try:
-        config = load_config(config_path)
-    except ConfigError as exc:
-        print(f"Configuration error: {exc}", file=sys.stderr)
-        return 1
-
-    session = ChatSession()
-    client = ChatClient(config)
-    tool_specs = list_tool_specs()
-    use_color = sys.stdout.isatty() and not args.no_color
-
-    config_location = _resolve_config_path(config_path)
-
-    config_line = f"Using API URL: {config.api_url} | Model: {config.model}"
-    print(style(config_line, TOOL_COLOR, use_color))
-    print(style(f"Config file: {config_location}", TOOL_COLOR, use_color))
-
-    print("Type /quit, /exit, or /q to leave the chat.")
-
-    while True:
+        config_path = args.config if args.config else None
         try:
-            prompt = style("You>", USER_COLOR, use_color) + " "
-            user_input = input(prompt)
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print("\n(Use /quit to exit)")
-            continue
+            config = load_config(config_path)
+        except ConfigError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
+            return 1
 
-        trimmed = user_input.strip()
-        if trimmed.lower() in EXIT_COMMANDS:
-            break
-        if not trimmed:
-            continue
+        client = ChatClient(config)
+        tool_specs = list_tool_specs()
+        use_color = sys.stdout.isatty() and not args.no_color
 
-        if args.no_history:
-            session = ChatSession()
+        config_location = _resolve_config_path(config_path)
 
-        history_checkpoint = len(session.messages)
-        session.add_user_message(user_input)
+        config_line = f"Using API URL: {config.api_url} | Model: {config.model}"
+        print(style(config_line, TOOL_COLOR, use_color))
+        print(style(f"Config file: {config_location}", TOOL_COLOR, use_color))
 
-        try:
-            _handle_assistant_interaction(session, client, tool_specs, use_color)
-        except KeyboardInterrupt:
-            if use_color:
-                print(RESET, end="", flush=True)
-            print("[interrupted]")
-            _restore_history(session, history_checkpoint)
-            continue
-        except APIError as exc:
-            if use_color:
-                print(RESET, end="", flush=True)
-            print(f"[API error] {exc}")
-            _restore_history(session, history_checkpoint)
-            continue
-        except ToolError as exc:
-            if use_color:
-                print(RESET, end="", flush=True)
-            print(f"[Tool error] {exc}")
-            _restore_history(session, history_checkpoint)
-            continue
-        except Exception as exc:  # pragma: no cover - defensive
-            if use_color:
-                print(RESET, end="", flush=True)
-            print(f"[error] {exc}")
-            _restore_history(session, history_checkpoint)
-            continue
+        print("Type /quit, /exit, or /q to leave the chat.")
 
-        if consume_farewell_request():
-            break
+        while True:
+            try:
+                prompt = style("You>", USER_COLOR, use_color) + " "
+                user_input = input(prompt)
+            except EOFError:
+                print()
+                break
+            except KeyboardInterrupt:
+                print("\n(Use /quit to exit)")
+                continue
 
-    print("Goodbye!")
-    return 0
+            trimmed = user_input.strip()
+            if trimmed.lower() in EXIT_COMMANDS:
+                break
+            if not trimmed:
+                continue
+
+            if args.no_history:
+                session = ChatSession()
+
+            history_checkpoint = len(session.messages)
+            session.add_user_message(user_input)
+
+            try:
+                _handle_assistant_interaction(session, client, tool_specs, use_color)
+            except KeyboardInterrupt:
+                if use_color:
+                    print(RESET, end="", flush=True)
+                print("[interrupted]")
+                _restore_history(session, history_checkpoint)
+                continue
+            except APIError as exc:
+                if use_color:
+                    print(RESET, end="", flush=True)
+                print(f"[API error] {exc}")
+                _restore_history(session, history_checkpoint)
+                continue
+            except ToolError as exc:
+                if use_color:
+                    print(RESET, end="", flush=True)
+                print(f"[Tool error] {exc}")
+                _restore_history(session, history_checkpoint)
+                continue
+            except Exception as exc:  # pragma: no cover - defensive
+                if use_color:
+                    print(RESET, end="", flush=True)
+                print(f"[error] {exc}")
+                _restore_history(session, history_checkpoint)
+                continue
+
+            if consume_farewell_request():
+                break
+
+        print("Goodbye!")
+        return 0
+    finally:
+        _write_last_log(session)
 
 
 def _handle_assistant_interaction(
@@ -216,3 +220,12 @@ def _resolve_config_path(provided_path: Optional[Path]) -> Path:
     from .config import ensure_config_file
 
     return ensure_config_file(None)
+
+
+def _write_last_log(session: ChatSession, path: Path = LAST_LOG_PATH) -> None:
+    payload = {"messages": session.messages}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - best-effort logging
+        print(f"Failed to write chat log to {path}: {exc}", file=sys.stderr)
