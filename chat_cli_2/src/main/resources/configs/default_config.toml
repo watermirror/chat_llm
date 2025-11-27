@@ -1,0 +1,5 @@
+# Chat CLI configuration
+api_url = "https://api.openai.com/v1/chat/completions"
+api_key = "sk-xxxx"
+model = "gpt-4o"
+temperature = 1.0

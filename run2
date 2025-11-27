@@ -1,0 +1,21 @@
+#!/bin/bash
+# Wrapper to launch the Kotlin Spring AI CLI with a JDK 17+ toolchain.
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$SCRIPT_DIR"
+
+APP_ARGS="$*"
+
+# Prefer a local JDK 17+ (macOS: /usr/libexec/java_home -v 17). Falls back to existing JAVA_HOME.
+if command -v /usr/libexec/java_home >/dev/null 2>&1; then
+  JAVA_HOME_CANDIDATE="$(/usr/libexec/java_home -v 17 2>/dev/null || true)"
+  if [ -n "$JAVA_HOME_CANDIDATE" ]; then
+    export JAVA_HOME="$JAVA_HOME_CANDIDATE"
+  fi
+fi
+
+if [ -n "$JAVA_HOME" ]; then
+  export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+exec mvn -f "$PROJECT_ROOT/chat_cli_2/pom.xml" spring-boot:run -Dspring-boot.run.arguments="$APP_ARGS"
