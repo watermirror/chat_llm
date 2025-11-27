@@ -19,7 +19,7 @@ import org.springframework.boot.runApplication
         OpenAiModerationAutoConfiguration::class,
     ],
 )
-open class ChatCliApplication
+class ChatCliApplication
 
 fun main(args: Array<String>) {
     runApplication<ChatCliApplication>(*args)

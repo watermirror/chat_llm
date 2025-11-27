@@ -17,15 +17,15 @@ import java.time.ZonedDateTime
 import java.util.concurrent.atomic.AtomicBoolean
 
 @Configuration
-open class ToolConfig {
+class ToolConfig {
 
     private val mapper = jacksonObjectMapper().registerKotlinModule()
 
     @Bean
-    open fun farewellRegistry(): FarewellRegistry = FarewellRegistry()
+    fun farewellRegistry(): FarewellRegistry = FarewellRegistry()
 
     @Bean
-    open fun toolCallbacks(
+    fun toolCallbacks(
         farewellRegistry: FarewellRegistry,
         recorder: ToolTranscriptRecorder,
     ): List<ToolCallback> = listOf(
@@ -34,7 +34,7 @@ open class ToolConfig {
     )
 
     @Bean
-    open fun toolCallingManager(toolCallbacks: List<ToolCallback>): ToolCallingManager {
+    fun toolCallingManager(toolCallbacks: List<ToolCallback>): ToolCallingManager {
         val resolver = StaticToolCallbackResolver(toolCallbacks)
         return ToolCallingManager.builder().toolCallbackResolver(resolver).build()
     }

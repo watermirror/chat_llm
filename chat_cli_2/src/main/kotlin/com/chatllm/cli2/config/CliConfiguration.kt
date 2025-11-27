@@ -12,19 +12,19 @@ import org.springframework.context.annotation.Configuration
 import java.net.URI
 
 @Configuration
-open class CliConfiguration(
+class CliConfiguration(
     private val configLoader: ConfigLoader,
     private val toolCallingManager: ToolCallingManager,
     private val toolCallbacks: List<ToolCallback>,
 ) {
     @Bean
-    open fun appSettings(args: ApplicationArguments): AppSettings {
+    fun appSettings(args: ApplicationArguments): AppSettings {
         val customConfig = args.getOptionValues("config")?.firstOrNull()
         return configLoader.load(customConfig)
     }
 
     @Bean
-    open fun chatModel(appSettings: AppSettings): ChatModel {
+    fun chatModel(appSettings: AppSettings): ChatModel {
         val (baseUrl, completionsPath) = normalizeBaseAndPath(appSettings.apiUrl)
 
         val api = OpenAiApi.builder()
