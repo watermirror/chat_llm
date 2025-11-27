@@ -1,27 +1,35 @@
 # Chat LLM CLI Toolkit
 
-This repo provides two CLIs for chatting with OpenAI-compatible APIs:
+Two CLIs for OpenAI-compatible chat:
 - `chat_cli/` (Python)
 - `chat_cli_2/` (Kotlin + Spring AI)
 
 ## Quick Start
-1) Prepare a config file (TOML) with `api_url`, `api_key`, `model`, `temperature`. You can copy a template via the helper script:
+1) 生成配置（TOML），默认位置：`~/.config/chat-cli/config.toml`。可用脚本快速拷贝模板：
 ```
-./config deepseek   # copies configs/config.toml.deepseek -> ~/.config/chat-cli/config.toml
+./config deepseek   # 拷贝 configs/config.toml.deepseek -> ~/.config/chat-cli/config.toml
 ```
-2) Run the Python CLI:
+2) 运行 Python CLI（默认读取上面的配置）：
 ```
-./run --config path/to/config.toml   # or omit --config to use ~/.config/chat-cli/config.toml
+./run
 ```
-3) Run the Kotlin CLI:
+3) 运行 Kotlin CLI（默认读取同一配置）：
 ```
-./run2 --config path/to/config.toml  --no-history --no-color
+./run2
 ```
 
 ## Notes
-- Both CLIs write the most recent conversation to `last_log.json` (ignored by git).
-- `get_current_time.year` (optional) in the repo root can override the year used by the time tool for testing.
-- Additional provider templates live under `configs/` (e.g., `config.toml.deepseek`, `config.toml.gpt-4o`).
+- 配置文件字段示例：
+  ```
+  api_url = "https://api.openai.com/v1/chat/completions"
+  api_key = "sk-xxxx"
+  model = "gpt-4o"
+  temperature = 1.0
+  ```
+  也可放在仓库根下 `.chat-cli/config.toml`，两端 CLI 都会按顺序查找。
+- `last_log.json` 记录最近一次对话，已在 .gitignore。
+- `get_current_time.year`（可选）放在仓库根或 `chat_cli_2/`，可覆盖时间工具返回的年份，用于测试。
+- 更多配置模板在 `configs/`（如 `config.toml.deepseek`, `config.toml.gpt-4o`）。
 
 ## Common Flags
 - `--config <path>`: explicit config file.
