@@ -33,5 +33,5 @@ Two CLIs for OpenAI-compatible chat:
 
 ## Common Flags
 - `--config <path>`: explicit config file.
-- `--no-history`: start each turn without prior messages (Python: resets per turn; Kotlin: clears session).
+- `--no-history`: start each turn without prior messages.
 - `--no-color`: disable ANSI colors.
