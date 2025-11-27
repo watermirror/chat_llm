@@ -210,3 +210,4 @@ __marimo__/
 configs/default_config.toml
 .idea/
 get_current_time.year
+last_log.json
