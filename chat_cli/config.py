@@ -9,7 +9,10 @@ from typing import Any, Dict, Optional
 try:  # Python 3.11+
     import tomllib as _tomllib
 except ModuleNotFoundError:  # pragma: no cover
-    _tomllib = None
+    try:
+        import tomli as _tomllib
+    except ModuleNotFoundError:
+        _tomllib = None
 
 
 DEFAULT_CONFIG_PATH = Path.home() / ".config" / "chat-cli" / "config.toml"
