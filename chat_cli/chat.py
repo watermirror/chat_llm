@@ -4,6 +4,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from chat_cli.base_prompt import BASE_SYSTEM_PROMPT
+
 
 Message = Dict[str, Any]
 
@@ -21,8 +23,8 @@ class ChatSession:
         face_to_face: bool = False,
         system_prompt: str = "",
     ) -> None:
-        # Build system prompt with history summary and face-to-face state
-        system_content = system_prompt
+        # Build system prompt: profile identity → universal rules → history → state
+        system_content = system_prompt + BASE_SYSTEM_PROMPT
         if history_summary:
             system_content += f"\n\n以下是你们之前的一些对话记录摘要：\n{history_summary}"
         if face_to_face:
