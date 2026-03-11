@@ -1,2 +1,12 @@
 #!/bin/bash
-python3 -m chat_cli "$@"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# If first arg is a profile name, convert to --profile
+if [[ -n "$1" && ! "$1" =~ ^- ]]; then
+    PROFILE_DIR="$SCRIPT_DIR/profiles/$1"
+    if [[ -d "$PROFILE_DIR" ]]; then
+        exec "$SCRIPT_DIR/.venv/bin/python" -m chat_cli --profile "$1" "${@:2}"
+    fi
+fi
+
+exec "$SCRIPT_DIR/.venv/bin/python" -m chat_cli "$@"

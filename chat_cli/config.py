@@ -32,6 +32,63 @@ class Config:
     temperature: float
 
 
+# Profile directories
+PROFILES_DIR = PACKAGE_ROOT / "profiles"
+
+
+@dataclass
+class Profile:
+    """Profile configuration containing persona and history."""
+
+    name: str
+    path: Path
+    system_prompt: str
+
+    @property
+    def log_dir(self) -> Path:
+        """Return the log directory for this profile."""
+        return self.path / "logs"
+
+
+def find_profile(name: str) -> Path | None:
+    """Find a profile directory by name."""
+    profile_path = PROFILES_DIR / name
+    if profile_path.is_dir():
+        return profile_path
+    return None
+
+
+def list_profiles() -> list[str]:
+    """List available profile names."""
+    if not PROFILES_DIR.exists():
+        return []
+    return [p.name for p in PROFILES_DIR.iterdir() if p.is_dir()]
+
+
+def load_profile(name: str) -> Profile:
+    """Load a profile by name."""
+    profile_path = find_profile(name)
+    if not profile_path:
+        raise ConfigError(f"profile '{name}' not found in {PROFILES_DIR}")
+
+    config_file = profile_path / "config.toml"
+    if not config_file.exists():
+        raise ConfigError(f"profile config not found: {config_file}")
+
+    try:
+        raw_config = _read_toml(config_file)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    system_prompt = str(raw_config.get("system_prompt", ""))
+
+    return Profile(
+        name=name,
+        path=profile_path,
+        system_prompt=system_prompt,
+    )
+
+
 def ensure_config_file(path: Path | None = None) -> Path:
     """Ensure the config file exists, writing defaults if necessary."""
 

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 
 Message = Dict[str, Any]
@@ -13,6 +13,33 @@ class ChatSession:
     """Track chat history and provide helpers for message management."""
 
     _messages: List[Message] = field(default_factory=list)
+
+    def __init__(
+        self,
+        initial_messages: Optional[List[Message]] = None,
+        history_summary: str = "",
+        face_to_face: bool = False,
+        system_prompt: str = "",
+    ) -> None:
+        # Build system prompt with history summary and face-to-face state
+        system_content = system_prompt
+        if history_summary:
+            system_content += f"\n\n以下是你们之前的一些对话记录摘要：\n{history_summary}"
+        if face_to_face:
+            system_content += "\n\n[当前状态] 你们现在处于见面状态。你可以使用 act 工具来描述动作。"
+        else:
+            system_content += "\n\n[当前状态] 你们现在不在一起，是线上聊天状态。act 工具已禁用。"
+
+        if initial_messages:
+            self._messages = list(initial_messages)
+            # Replace old system prompt with new one
+            if self._messages and self._messages[0].get("role") == "system":
+                self._messages[0] = {"role": "system", "content": system_content}
+            else:
+                # If no system message, prepend one
+                self._messages.insert(0, {"role": "system", "content": system_content})
+        else:
+            self._messages = [{"role": "system", "content": system_content}]
 
     @property
     def messages(self) -> List[Message]:

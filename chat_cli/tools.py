@@ -64,12 +64,83 @@ _FAREWELL_TOOL = Tool(
     },
 )
 
+_ACT_TOOL = Tool(
+    name="act",
+    description="描述你在见面时的动作。只能在见面状态下使用。如果同时要说话，请用 speech 参数。",
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "description": "你要做的动作，比如 '轻轻握住他的手'",
+            },
+            "speech": {
+                "type": "string",
+                "description": "可选，你同时说的话，比如 '想我了吗？'",
+            }
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+)
 
-AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _FAREWELL_TOOL]
+
+AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _FAREWELL_TOOL, _ACT_TOOL]
 
 _YEAR_OVERRIDE_FILE = Path("get_current_time.year")
 
 _farewell_requested = False
+_is_face_to_face = False
+_act_call_count = 0
+MAX_ACT_CALLS_PER_TURN = 5
+
+# Face-to-face state file path (set by init_face_to_face_state)
+_face_to_face_file: Optional[Path] = None
+
+
+def _save_face_to_face_state() -> None:
+    """Persist face-to-face state to file."""
+    if _face_to_face_file is None:
+        return
+    try:
+        _face_to_face_file.parent.mkdir(parents=True, exist_ok=True)
+        _face_to_face_file.write_text("1" if _is_face_to_face else "0", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _load_face_to_face_state() -> bool:
+    """Load face-to-face state from file."""
+    if _face_to_face_file is None:
+        return False
+    try:
+        if _face_to_face_file.exists():
+            return _face_to_face_file.read_text(encoding="utf-8").strip() == "1"
+    except Exception:
+        pass
+    return False
+
+
+def init_face_to_face_state(profile_path: Optional[Path] = None) -> None:
+    """Initialize face-to-face state from file on startup.
+
+    Args:
+        profile_path: Path to profile directory. If None, uses default location.
+    """
+    global _is_face_to_face, _face_to_face_file
+
+    if profile_path:
+        _face_to_face_file = profile_path / ".face_to_face"
+    else:
+        _face_to_face_file = Path(__file__).resolve().parent.parent / ".face_to_face"
+
+    _is_face_to_face = _load_face_to_face_state()
+
+
+def reset_act_call_count() -> None:
+    """Reset act call count when user sends a new message."""
+    global _act_call_count
+    _act_call_count = 0
 
 
 def list_tool_specs() -> List[Dict[str, Any]]:
@@ -91,6 +162,10 @@ def execute_tool(name: str, arguments_json: str) -> str:
     if name == _FAREWELL_TOOL.name:
         arguments = _parse_arguments(arguments_json)
         return _register_farewell(arguments)
+
+    if name == _ACT_TOOL.name:
+        arguments = _parse_arguments(arguments_json)
+        return _execute_act(arguments)
 
     raise ToolError(f"Unknown tool: {name}")
 
@@ -167,6 +242,9 @@ def _apply_year_override(iso_time: str, year: str) -> str:
 
 def _register_farewell(arguments: Dict[str, Any]) -> str:
     global _farewell_requested
+    if _is_face_to_face:
+        # 静默忽略，不设置退出标记
+        return json.dumps({"farewell_registered": False, "reason": "见面时不能说再见"})
     note = arguments.get("note")
     if note is not None and not isinstance(note, str):
         raise ToolError("'note' must be a string if provided")
@@ -177,9 +255,74 @@ def _register_farewell(arguments: Dict[str, Any]) -> str:
     return json.dumps(payload)
 
 
+def _execute_act(arguments: Dict[str, Any]) -> str:
+    """Execute act tool for agent."""
+    global _act_call_count
+
+    if not _is_face_to_face:
+        raise ToolError("现在不在一起，无法使用 act 工具")
+
+    if _act_call_count >= MAX_ACT_CALLS_PER_TURN:
+        raise ToolError(f"一次交互最多只能调用 {MAX_ACT_CALLS_PER_TURN} 次 act 工具，请等待用户回应后再继续行动")
+
+    action = arguments.get("action")
+    if not action or not isinstance(action, str):
+        raise ToolError("'action' is required and must be a string")
+
+    speech = arguments.get("speech")
+    if speech is not None and not isinstance(speech, str):
+        raise ToolError("'speech' must be a string if provided")
+
+    _act_call_count += 1
+
+    if speech:
+        result = f"[动作] {action}\n[说话] {speech}"
+    else:
+        result = f"[动作] {action}"
+
+    return json.dumps({"act_result": result}, ensure_ascii=False)
+
+
 def consume_farewell_request() -> bool:
     global _farewell_requested
     if _farewell_requested:
         _farewell_requested = False
         return True
     return False
+
+
+def handle_face2face(scene: str) -> str:
+    """Generate system message for face-to-face meeting."""
+    global _is_face_to_face
+    _is_face_to_face = True
+    _save_face_to_face_state()
+    msg = "[系统事件] 你们现在处于见面状态。你可以使用 act 工具来描述动作。"
+    if scene:
+        msg += f"\n场景：{scene}"
+    return msg
+
+
+def handle_separate(scene: str) -> str:
+    """Generate system message for separation."""
+    global _is_face_to_face
+    _is_face_to_face = False
+    _save_face_to_face_state()
+    msg = "[系统事件] 你们现在分开了，不再处于见面状态。act 工具已禁用。"
+    if scene:
+        msg += f"\n场景：{scene}"
+    return msg
+
+
+def is_face_to_face() -> bool:
+    """Check if currently in face-to-face mode."""
+    return _is_face_to_face
+
+
+def handle_act(action: str, speech: str = "") -> tuple[str, bool]:
+    """Generate message for action. Returns (message, valid)."""
+    if not _is_face_to_face:
+        return "[系统提示] 现在你们不在一起，无法使用 act 命令。", False
+
+    if speech:
+        return f"[动作] {action}\n[说话] {speech}", True
+    return f"[动作] {action}", True

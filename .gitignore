@@ -211,3 +211,8 @@ configs/default_config.toml
 .idea/
 get_current_time.year
 last_log.json
+
+# Profile runtime files
+profiles/*/logs/
+profiles/*/.face_to_face
+profiles/*/config.toml
