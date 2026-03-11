@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
+
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -13,10 +15,19 @@ from .client import APIError, ChatClient
 from .config import ConfigError, DEFAULT_CONFIG_PATH, Profile, load_config, load_profile, list_profiles
 from .tools import ToolError, consume_farewell_request, execute_tool, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count
 
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.formatted_text import ANSI
+
 RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
 USER_COLOR = "\033[35m"  # Magenta
 AI_COLOR = "\033[36m"  # Cyan
 TOOL_COLOR = "\033[33m"  # Yellow
+ACTION_COLOR = "\033[32m"  # Green
+SYSTEM_COLOR = "\033[34m"  # Blue
+GRAY = "\033[90m"  # Gray
+TITLE_COLOR = "\033[36;1m"  # Bold Cyan
 
 
 def style(text: str, color: str, enable: bool) -> str:
@@ -25,7 +36,32 @@ def style(text: str, color: str, enable: bool) -> str:
     return f"{color}{text}{RESET}"
 
 
+def _prompt_style(text: str, color: str, enable: bool) -> str:
+    """Style text for use in input() prompts with readline-safe escape wrapping."""
+    if not enable:
+        return text
+    return f"\001{color}\002{text}\001{RESET}\002"
+
+
 EXIT_COMMANDS = {"/quit", "/exit", "/q"}
+
+
+def _now_ts() -> str:
+    """Return current timestamp in YYYY-MM-DD HH:MM format."""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
+
+
+_TS_PATTERN = re.compile(r"\s*<\d{4}-\d{2}-\d{2} \d{2}:\d{2}>\s*$")
+
+
+def _print_ts(ts: str, use_color: bool) -> None:
+    """Print a timestamp line in gray."""
+    print(style(f"─────────────────── {ts} ───", GRAY, use_color))
+
+
+def _strip_ai_timestamp(text: str) -> str:
+    """Remove trailing timestamp tag from AI reply if present."""
+    return _TS_PATTERN.sub("", text).rstrip("\n")
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent
 MAX_LOG_SIZE = 150000  # 150K characters, append to same file if under this limit
 
@@ -113,31 +149,32 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             system_prompt=system_prompt,
         )
 
+        # Title
+        _print_title(use_color)
+
+        # Replay previous conversation history
+        _replay_history(session.messages, use_color)
+
+        # Config info after history, rendered in a box
         config_location = _resolve_config_path(config_path)
-
-        config_line = f"Using API URL: {config.api_url} | Model: {config.model}"
-        print(style(config_line, TOOL_COLOR, use_color))
-        print(style(f"Config file: {config_location}", TOOL_COLOR, use_color))
-        if profile:
-            print(style(f"Profile: {profile.name}", TOOL_COLOR, use_color))
+        profile_name = profile.name if profile else "default"
+        info_entries = [
+            ("Profile", profile_name),
+            ("Model", config.model),
+            ("API", config.api_url),
+            ("Config", str(config_location)),
+        ]
         if history_summary:
-            print(style(f"Loaded history summary ({len(history_summary)} chars)", TOOL_COLOR, use_color))
+            info_entries.append(("History", f"summary loaded ({len(history_summary)} chars)"))
         if is_face_to_face():
-            print(style("当前状态: 见面中", TOOL_COLOR, use_color))
-
-        print("Type /quit, /exit, or /q to leave the chat.")
-
-        # Debug: print face-to-face state and system prompt
-        print(style(f"\n[Debug] is_face_to_face: {is_face_to_face()}", TOOL_COLOR, use_color))
-        if session.messages and session.messages[0].get("role") == "system":
-            print(style("=== System Prompt ===", TOOL_COLOR, use_color))
-            print(session.messages[0]["content"])
-            print(style("=== End System Prompt ===\n", TOOL_COLOR, use_color))
+            info_entries.append(("Status", "见面中"))
+        info_entries.append(("Exit", "/quit /exit /q"))
+        _print_info_box(info_entries, use_color)
 
         while True:
             try:
-                prompt = style("You>", USER_COLOR, use_color) + " "
-                user_input = input(prompt)
+                prompt_str = style("You>", USER_COLOR, use_color) + " "
+                user_input = pt_prompt(ANSI(prompt_str))
             except EOFError:
                 print()
                 break
@@ -150,6 +187,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 break
             if not trimmed:
                 continue
+
+            # Show user timestamp
+            _print_ts(_now_ts(), use_color)
 
             if args.no_history:
                 session = ChatSession(
@@ -167,11 +207,13 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             if trimmed.lower().startswith("face:"):
                 scene = trimmed[5:].strip()
                 system_msg = handle_face2face(scene)
-                session.add_message({"role": "system", "content": system_msg})
+                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
+                _print_system_event(system_msg, use_color)
             elif trimmed.lower().startswith("sep:"):
                 scene = trimmed[4:].strip()
                 system_msg = handle_separate(scene)
-                session.add_message({"role": "system", "content": system_msg})
+                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
+                _print_system_event(system_msg, use_color)
             elif trimmed.lower().startswith("act:"):
                 # Parse act and optional say
                 rest = trimmed[4:].strip()
@@ -185,11 +227,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
                 msg, valid = handle_act(action, speech)
                 if valid:
-                    session.add_user_message(msg)
+                    session.add_message({"role": "user", "content": msg, "ts": _now_ts()})
                 else:
-                    session.add_message({"role": "system", "content": msg})
+                    print(style(msg, TOOL_COLOR, use_color))
+                    continue
+            elif "act:" in trimmed.lower():
+                # act: not at the start of message
+                print(style("[提示] act: 必须在消息开头使用", TOOL_COLOR, use_color))
+                continue
             else:
-                session.add_user_message(user_input)
+                session.add_message({"role": "user", "content": user_input, "ts": _now_ts()})
 
             try:
                 _handle_assistant_interaction(session, client, tool_specs, use_color)
@@ -242,18 +289,25 @@ def _handle_assistant_interaction(
         if use_color:
             print(AI_COLOR, end="", flush=True)
 
-        assistant_reply, tool_calls = _stream_response(session, client, tool_specs)
+        assistant_reply, tool_calls, ended_nl = _stream_response(session, client, tool_specs, use_color)
 
         if use_color:
             print(RESET, end="", flush=True)
-        print()
+        if not ended_nl:
+            print()
 
+        ts = _now_ts()
+        clean_reply = _strip_ai_timestamp(assistant_reply)
         if tool_calls:
-            session.add_assistant_tool_call(tool_calls, assistant_reply)
+            msg: Dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls, "ts": ts}
+            if clean_reply:
+                msg["content"] = clean_reply
+            session.add_message(msg)
             _process_tool_calls(session, tool_calls, use_color)
         else:
-            if assistant_reply:
-                session.add_assistant_message(assistant_reply)
+            if clean_reply:
+                session.add_message({"role": "assistant", "content": clean_reply, "ts": ts})
+                _print_ts(ts, use_color)
             awaiting_final = False
 
 
@@ -261,20 +315,158 @@ def _stream_response(
     session: ChatSession,
     client: ChatClient,
     tool_specs: List[Dict[str, Any]],
-) -> Tuple[str, List[Dict[str, Any]]]:
+    use_color: bool = True,
+) -> Tuple[str, List[Dict[str, Any]], bool]:
+    """Stream response and return (full_text, tool_calls, ended_with_newline)."""
     assistant_chunks: List[str] = []
     collected_tool_calls: List[Dict[str, Any]] = []
+    # Buffer to detect and suppress trailing timestamp
+    buffer = ""
+    last_printed = ""
 
     for event in client.stream_chat(session.messages, tools=tool_specs):
         event_type = event.get("type")
         if event_type == "content":
             text = event.get("text", "")
-            print(text, end="", flush=True)
             assistant_chunks.append(text)
+            buffer += text
+            safe, held = _split_safe_output(buffer)
+            if safe:
+                print(safe, end="", flush=True)
+                last_printed = safe
+                buffer = held
         elif event_type == "tool_call":
             collected_tool_calls.append(event["tool_call"])
 
-    return "".join(assistant_chunks), collected_tool_calls
+    # Flush remaining buffer, stripping any timestamp and trailing newlines
+    if buffer:
+        clean = _strip_ai_timestamp(buffer).rstrip("\n")
+        if clean:
+            print(clean, end="", flush=True)
+            last_printed = clean
+
+    ended_with_newline = last_printed.endswith("\n")
+    return "".join(assistant_chunks), collected_tool_calls, ended_with_newline
+
+
+def _split_safe_output(buffer: str) -> Tuple[str, str]:
+    """Split buffer into safe-to-print prefix and held-back suffix.
+
+    Hold back content after the last newline if it could be a timestamp start.
+    """
+    # If buffer ends mid-potential-timestamp, hold back from last \n or <
+    # Timestamp pattern: \n<YYYY-MM-DD HH:MM> or <YYYY-MM-DD HH:MM>
+    last_nl = buffer.rfind("\n")
+    if last_nl == -1:
+        # No newline - check if the whole buffer could be a timestamp start
+        if buffer.lstrip().startswith("<"):
+            return "", buffer
+        return buffer, ""
+
+    after_nl = buffer[last_nl + 1:]
+    # If what's after the last newline looks like it could be a timestamp start
+    partial = after_nl.lstrip()
+    if not partial:
+        # Just a trailing newline, safe to print all
+        return buffer, ""
+    if partial.startswith("<") or (len(partial) <= 20 and partial[0].isdigit()):
+        # Could be start of timestamp, hold back
+        return buffer[:last_nl + 1], after_nl
+    return buffer, ""
+
+
+def _print_system_event(content: str, use_color: bool) -> None:
+    """Print a system event (face/sep) in a readable format."""
+    for line in content.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("[系统事件]"):
+            text = line[len("[系统事件]"):].strip()
+            print(style(f"  ── {text} ──", SYSTEM_COLOR, use_color))
+        elif line.startswith("场景："):
+            scene = line[len("场景："):]
+            print(style(f"  场景：{scene}", SYSTEM_COLOR, use_color))
+        elif line.startswith("[当前状态]"):
+            text = line[len("[当前状态]"):].strip()
+            print(style(f"  {text}", SYSTEM_COLOR, use_color))
+        else:
+            print(style(f"  {line}", SYSTEM_COLOR, use_color))
+
+
+
+def _print_act_result(result_json: str, use_color: bool) -> None:
+    """Print act tool result in AI Action> / AI Speech> format."""
+    try:
+        data = json.loads(result_json)
+        act_result = data.get("act_result", "")
+    except (json.JSONDecodeError, AttributeError):
+        act_result = result_json
+
+    for line in act_result.split("\n"):
+        if line.startswith("[动作] "):
+            action = line[5:]
+            print(f"{style('AI Action>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
+        elif line.startswith("[说话] "):
+            speech = line[5:]
+            print(f"{style('AI Speech>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
+
+
+def _print_time_result(result_json: str, use_color: bool) -> None:
+    """Print get_current_time result in a clean format."""
+    try:
+        data = json.loads(result_json)
+        time_str = data.get("current_time", "")
+        tz = data.get("timezone", "")
+        # Parse and format nicely
+        if "T" in time_str:
+            date_part, time_part = time_str.split("T", 1)
+            # Trim microseconds and tz offset for display
+            time_short = time_part.split(".")[0].split("+")[0].split("-")[0]
+            print(style(f"  ⏰ {date_part} {time_short} ({tz})", DIM + TOOL_COLOR, use_color))
+        else:
+            print(style(f"  ⏰ {time_str} ({tz})", DIM + TOOL_COLOR, use_color))
+    except (json.JSONDecodeError, AttributeError):
+        print(style(f"  ⏰ {result_json}", DIM + TOOL_COLOR, use_color))
+
+
+def _get_tool_name_for_result(tool_msg: Dict[str, Any], messages: List[Dict[str, Any]]) -> str:
+    """Get the tool name for a tool result message."""
+    tool_call_id = tool_msg.get("tool_call_id", "")
+    for msg in messages:
+        if msg.get("role") == "assistant" and "tool_calls" in msg:
+            for tc in msg["tool_calls"]:
+                if tc.get("id") == tool_call_id:
+                    return tc.get("function", {}).get("name", "")
+    return ""
+
+
+def _print_farewell_result(result_json: str, use_color: bool) -> None:
+    """Print register_farewell result in a clean format."""
+    try:
+        data = json.loads(result_json)
+        registered = data.get("farewell_registered", False)
+        if registered:
+            print(style("  👋 告别", DIM + TOOL_COLOR, use_color))
+        else:
+            reason = data.get("reason", "")
+            print(style(f"  👋 告别被拒绝：{reason}", DIM + TOOL_COLOR, use_color))
+    except (json.JSONDecodeError, AttributeError):
+        print(style(f"  👋 {result_json}", DIM + TOOL_COLOR, use_color))
+
+
+def _print_act_call(arguments_json: str, use_color: bool) -> None:
+    """Print act tool call in AI Action> / AI Speech> format from call arguments."""
+    try:
+        args = json.loads(arguments_json)
+    except (json.JSONDecodeError, AttributeError):
+        return
+    action = args.get("action", "")
+    speech = args.get("speech", "")
+    if action:
+        print(f"{style('AI Action>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
+    if speech:
+        print(f"{style('AI Speech>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
 
 
 def _process_tool_calls(
@@ -288,26 +480,123 @@ def _process_tool_calls(
         arguments = function_data.get("arguments", "")
         tool_id = tool_call.get("id", "")
 
-        invocation = f"[tool-call] {name}({arguments})"
-        print(style(invocation, TOOL_COLOR, use_color))
+        if name in ("act", "get_current_time", "register_farewell"):
+            pass
+        else:
+            invocation = f"[tool-call] {name}({arguments})"
+            print(style(invocation, TOOL_COLOR, use_color))
 
         try:
             result = execute_tool(name, arguments)
         except ToolError as exc:
             result = json.dumps({"error": str(exc)})
             session.add_tool_message(tool_id, result)
-            error_line = f"[tool-error] {exc}"
-            print(style(error_line, TOOL_COLOR, use_color))
-            raise
+            if name == "act":
+                print(style(f"[act-error] {exc}", TOOL_COLOR, use_color))
+            else:
+                print(style(f"[tool-error] {exc}", TOOL_COLOR, use_color))
+                raise
+            continue
 
         session.add_tool_message(tool_id, result)
-        output_line = f"[tool-result] {result}"
-        print(style(output_line, TOOL_COLOR, use_color))
+
+        if name == "act":
+            _print_act_result(result, use_color)
+        elif name == "get_current_time":
+            _print_time_result(result, use_color)
+        elif name == "register_farewell":
+            _print_farewell_result(result, use_color)
+        else:
+            output_line = f"[tool-result] {result}"
+            print(style(output_line, TOOL_COLOR, use_color))
 
 
 def _restore_history(session: ChatSession, checkpoint: int) -> None:
     while len(session.messages) > checkpoint:
         session.remove_last_message()
+
+
+def _print_info_box(entries: List[Tuple[str, str]], use_color: bool) -> None:
+    """Print config info in a styled box."""
+    label_width = max(len(k) for k, _ in entries)
+    inner_lines = [f" {k:<{label_width}} : {v} " for k, v in entries]
+    content_width = max(len(line) for line in inner_lines)
+    top = "  ┌" + "─" * content_width + "┐"
+    bot = "  └" + "─" * content_width + "┘"
+    print(style(top, TOOL_COLOR, use_color))
+    for line in inner_lines:
+        print(style(f"  │{line:<{content_width}}│", TOOL_COLOR, use_color))
+    print(style(bot, TOOL_COLOR, use_color))
+    print()
+
+
+def _print_title(use_color: bool) -> None:
+    """Print a styled title banner on startup."""
+    title = (
+        "\n"
+        "  ╔══════════════════════════════════╗\n"
+        "  ║" + "Chat CLI".center(34) + "║\n"
+        "  ╚══════════════════════════════════╝"
+    )
+    print(style(title, TITLE_COLOR, use_color))
+    print()
+
+
+def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separator: bool = True) -> None:
+    """Print previous conversation messages so the user can see chat history."""
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+
+        ts = msg.get("ts", "")
+
+        if role == "system":
+            # Show face/sep events, skip initial system prompt
+            if "[系统事件]" in content:
+                _print_system_event(content, use_color)
+            continue
+        elif role == "user":
+            print(f"{style('You>', USER_COLOR, use_color)} {content}")
+            if ts:
+                _print_ts(ts, use_color)
+        elif role == "assistant":
+            if content:
+                print(f"{style('AI>', AI_COLOR, use_color)} {style(content, AI_COLOR, use_color)}")
+            if "tool_calls" in msg:
+                for tc in msg["tool_calls"]:
+                    func = tc.get("function", {})
+                    name = func.get("name", "")
+                    arguments = func.get("arguments", "")
+                    if name == "act":
+                        _print_act_call(arguments, use_color)
+                    elif name in ("get_current_time", "register_farewell"):
+                        pass  # result will be shown in tool message
+                    else:
+                        print(style(f"[tool-call] {name}({arguments})", TOOL_COLOR, use_color))
+            elif ts:
+                # Show timestamp for final assistant message (no tool_calls)
+                _print_ts(ts, use_color)
+        elif role == "tool":
+            tool_name = _get_tool_name_for_result(msg, messages)
+            if tool_name == "act":
+                # Show act errors, skip successful results (already shown via _print_act_call)
+                try:
+                    data = json.loads(content)
+                    if "error" in data:
+                        print(style(f"[act-error] {data['error']}", TOOL_COLOR, use_color))
+                except (json.JSONDecodeError, AttributeError):
+                    pass
+                continue
+            elif tool_name == "get_current_time":
+                _print_time_result(content, use_color)
+                continue
+            elif tool_name == "register_farewell":
+                _print_farewell_result(content, use_color)
+                continue
+            print(style(f"[tool-result] {content}", TOOL_COLOR, use_color))
+
+    if show_separator and len(messages) > 1:
+        print(style("--- 以上是之前的对话 ---\n", TOOL_COLOR, use_color))
 
 
 def _resolve_config_path(provided_path: Optional[Path]) -> Path:
@@ -326,6 +615,20 @@ def _write_last_log(session: ChatSession, path: Path) -> None:
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception as exc:  # pragma: no cover - best-effort logging
         print(f"Failed to write chat log to {path}: {exc}", file=sys.stderr)
+
+    # Write human-readable log alongside the JSON
+    readable_path = path.with_suffix(".good4read.log")
+    try:
+        import io
+        buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = buf
+        _replay_history(session.messages, use_color=False, show_separator=False)
+        sys.stdout = old_stdout
+        readable_path.write_text(buf.getvalue(), encoding="utf-8")
+    except Exception as exc:  # pragma: no cover - best-effort
+        sys.stdout = old_stdout  # ensure restore
+        print(f"Failed to write readable log to {readable_path}: {exc}", file=sys.stderr)
 
 
 def _get_log_path_for_session(session: ChatSession) -> Path:

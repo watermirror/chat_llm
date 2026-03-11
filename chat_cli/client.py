@@ -97,9 +97,21 @@ class ChatClient:
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Iterator[Dict[str, Any]]:
+        # Embed 'ts' field into message content so the API can see timestamps
+        api_messages = []
+        for m in messages:
+            ts = m.get("ts")
+            msg = {k: v for k, v in m.items() if k != "ts"}
+            if ts and "tool_calls" not in msg and msg.get("role") != "tool":
+                existing = msg.get("content", "")
+                if existing:
+                    msg["content"] = f"{existing}\n<{ts}>"
+                else:
+                    msg["content"] = f"<{ts}>"
+            api_messages.append(msg)
         request: Dict[str, Any] = {
             "model": self._config.model,
-            "messages": messages,
+            "messages": api_messages,
             "temperature": self._config.temperature,
         }
 
