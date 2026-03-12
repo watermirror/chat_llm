@@ -243,7 +243,7 @@ class ChatClient:
             )
 
         if not fields:
-            fields["_unused"] = (Optional[str], Field(default=None))
+            fields["unused"] = (Optional[str], Field(default=None))
 
         model_name = f"ToolArgs_{name}"
         return create_model(model_name, **fields)  # type: ignore[return-value]

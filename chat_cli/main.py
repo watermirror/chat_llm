@@ -63,7 +63,7 @@ def _strip_ai_timestamp(text: str) -> str:
     """Remove trailing timestamp tag from AI reply if present."""
     return _TS_PATTERN.sub("", text).rstrip("\n")
 DEFAULT_LOG_DIR = Path(__file__).resolve().parent.parent
-MAX_LOG_SIZE = 150000  # 150K characters, append to same file if under this limit
+MAX_LOG_SIZE = 100000  # 100K characters, append to same file if under this limit
 
 # Global profile state (set in main)
 _active_profile: Optional[Profile] = None
@@ -78,6 +78,17 @@ def _ai_name() -> str:
 
 def _ai_label() -> str:
     return f"{_ai_name()}>"
+
+
+_LOG_NAME_PATTERN = re.compile(r"^chat_\d{8}_\d{6}\.json$")
+
+
+def _list_log_files() -> List[Path]:
+    """List log files matching the expected naming pattern, sorted newest first."""
+    return sorted(
+        (f for f in _log_dir.glob("chat_*.json") if _LOG_NAME_PATTERN.match(f.name)),
+        reverse=True,
+    )
 
 
 def _generate_log_path() -> Path:
@@ -144,6 +155,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             print(f"Configuration error: {exc}", file=sys.stderr)
             return 1
 
+        session = None
         client = ChatClient(config)
         tool_specs = list_tool_specs()
         use_color = sys.stdout.isatty() and not args.no_color
@@ -281,8 +293,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("Goodbye!")
         return 0
     finally:
-        final_path = _get_log_path_for_session(session)
-        _write_last_log(session, final_path)
+        if session is not None:
+            final_path = _get_log_path_for_session(session)
+            _write_last_log(session, final_path)
 
 
 def _handle_assistant_interaction(
@@ -490,7 +503,7 @@ def _process_tool_calls(
         arguments = function_data.get("arguments", "")
         tool_id = tool_call.get("id", "")
 
-        if name in ("act", "get_current_time", "register_farewell"):
+        if name in ("act", "get_current_time", "register_farewell", "noop"):
             pass
         else:
             invocation = f"[tool-call] {name}({arguments})"
@@ -516,6 +529,8 @@ def _process_tool_calls(
             _print_time_result(result, use_color)
         elif name == "register_farewell":
             _print_farewell_result(result, use_color)
+        elif name == "noop":
+            print(f"{style(_ai_label(), DIM + AI_COLOR, use_color)} {style('...', DIM + AI_COLOR, use_color)}")
         else:
             output_line = f"[tool-result] {result}"
             print(style(output_line, TOOL_COLOR, use_color))
@@ -579,6 +594,8 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
                     arguments = func.get("arguments", "")
                     if name == "act":
                         _print_act_call(arguments, use_color)
+                    elif name == "noop":
+                        print(f"{style(_ai_label(), DIM + AI_COLOR, use_color)} {style('...', DIM + AI_COLOR, use_color)}")
                     elif name in ("get_current_time", "register_farewell"):
                         pass  # result will be shown in tool message
                     else:
@@ -603,6 +620,8 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
             elif tool_name == "register_farewell":
                 _print_farewell_result(content, use_color)
                 continue
+            elif tool_name == "noop":
+                continue  # already shown via tool_calls
             print(style(f"[tool-result] {content}", TOOL_COLOR, use_color))
 
     if show_separator and len(messages) > 1:
@@ -642,18 +661,16 @@ def _write_log_to_path(messages: List[Dict[str, Any]], path: Path) -> None:
         print(f"Failed to write readable log to {readable_path}: {exc}", file=sys.stderr)
 
 
+def _messages_size(messages: List[Dict[str, Any]]) -> int:
+    """Estimate serialized size of messages."""
+    return len(json.dumps(messages, ensure_ascii=False))
+
+
 def _write_last_log(session: ChatSession, path: Path) -> None:
     """Save session to log, splitting into a new file if over MAX_LOG_SIZE."""
     messages = session.messages
 
-    # Calculate total content size
-    total_size = 0
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_size += len(content)
-
-    if total_size <= MAX_LOG_SIZE:
+    if _messages_size(messages) <= MAX_LOG_SIZE:
         _write_log_to_path(messages, path)
         return
 
@@ -678,7 +695,7 @@ def _write_last_log(session: ChatSession, path: Path) -> None:
 
 def _get_log_path_for_session(session: ChatSession) -> Path:
     """Get the latest log file path, or create a new one if none exists."""
-    log_files = sorted(_log_dir.glob("chat_*.json"), reverse=True)
+    log_files = _list_log_files()
     if log_files:
         return log_files[0]
     return _generate_log_path()
@@ -687,7 +704,7 @@ def _get_log_path_for_session(session: ChatSession) -> Path:
 def _load_last_log() -> List[Dict[str, Any]]:
     """Load previous conversation from the most recent log file."""
     try:
-        log_files = sorted(_log_dir.glob("chat_*.json"), reverse=True)
+        log_files = _list_log_files()
         if not log_files:
             return []
         latest = log_files[0]
@@ -702,18 +719,62 @@ def _load_last_log() -> List[Dict[str, Any]]:
 
 MAX_SUMMARY_SIZE = 10000  # 10K characters per summary
 
+_SUMMARY_SYSTEM_PROMPT = "你是一个互动记录摘要助手。你的任务是为角色扮演聊天生成摘要，帮助 AI 角色在下次互动时快速回忆之前发生了什么。"
+
+_SUMMARY_CACHE_FILE = "history_summary.json"
+
+
+def _render_messages_to_text(messages: List[Dict[str, Any]]) -> str:
+    """Render messages to plain text using _replay_history (good4read format)."""
+    import io
+    buf = io.StringIO()
+    old_stdout = sys.stdout
+    sys.stdout = buf
+    try:
+        _replay_history(messages, use_color=False, show_separator=False)
+    finally:
+        sys.stdout = old_stdout
+    return buf.getvalue()
+
 
 def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) -> str:
-    """Use LLM to summarize a conversation."""
-    summary_prompt = """请用中文总结以下对话的主要内容，保留重要信息和情感细节。用简洁自然的语言，不要超过500字。
+    """Use LLM to summarize a conversation using good4read format."""
+    # Filter out initial system prompt, keep system events
+    dialog_messages = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system" and i == 0 and "[系统事件]" not in msg.get("content", ""):
+            continue
+        dialog_messages.append(msg)
 
-对话内容：
-""" + _format_messages_for_summary(messages)
+    conversation_text = _render_messages_to_text(dialog_messages)
+    if not conversation_text.strip():
+        return ""
+
+    ai_name = _ai_name()
+    summary_prompt = f"""请为以下互动记录生成摘要。摘要将作为 AI 角色的"记忆"注入到下次互动中。
+
+要求：
+- 用第三人称叙述（"用户做了什么"、"角色做了什么"）
+- 保留关键事件、情感变化、重要承诺或约定
+- 保留时间信息（大约几点发生了什么）
+- 如果有见面/分开事件（系统事件），注明
+- 摘要不超过 10KB
+
+格式说明：
+- "You>" 是用户发言
+- "{ai_name}>" 是 AI 角色发言
+- "{ai_name} do>" 是角色的动作
+- "{ai_name} say>" 是角色做动作时同时说的话
+- "─── 时间 ───" 是时间戳
+- "[系统事件]" 是系统事件（见面/分开等）
+
+互动记录：
+{conversation_text}"""
 
     try:
         result_text = ""
         for event in client.stream_chat([
-            {"role": "system", "content": "你是一个对话摘要助手，擅长用简洁的语言总结对话内容。"},
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": summary_prompt}
         ]):
             if event.get("type") == "content":
@@ -723,36 +784,27 @@ def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) 
         return ""
 
 
-def _format_messages_for_summary(messages: List[Dict[str, Any]]) -> str:
-    """Format messages for summary prompt."""
-    lines = []
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"用户: {content}")
-        elif role == "assistant":
-            lines.append(f"爱丽丝: {content}")
-    return "\n".join(lines)
-
-
 def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
     """Summarize multiple summaries into one if too long."""
     combined = "\n\n---\n\n".join(summaries)
     if len(combined) <= MAX_SUMMARY_SIZE:
         return combined
 
-    summary_prompt = f"""请将以下多段对话摘要合并成一个整体摘要，保留重要的时间线和情感发展。不超过800字。
+    summary_prompt = f"""请将以下多段互动摘要合并为一个整体摘要。这个摘要将作为 AI 角色的"记忆"使用。
 
-摘要内容：
+要求：
+- 按时间顺序组织
+- 保留重要事件、情感发展、承诺和约定
+- 去除重复信息
+- 合并后不超过 10KB
+
+各段摘要：
 {combined}"""
 
     try:
         result_text = ""
         for event in client.stream_chat([
-            {"role": "system", "content": "你是一个对话摘要助手，擅长合并多个摘要。"},
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": summary_prompt}
         ]):
             if event.get("type") == "content":
@@ -762,9 +814,67 @@ def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
         return combined[:MAX_SUMMARY_SIZE]
 
 
+def _merge_summary_with_new(client: ChatClient, existing_summary: str, new_summaries: List[str]) -> str:
+    """Merge existing cached summary with new conversation summaries."""
+    new_summaries_combined = "\n\n---\n\n".join(new_summaries)
+
+    summary_prompt = f"""以下是之前多次互动的摘要（已有记忆），以及最近几次新互动的摘要。请将它们合并为一个整体摘要，作为 AI 角色的"记忆"使用。
+
+要求：
+- 按时间顺序组织，新内容接续在已有记忆之后
+- 保留重要事件、情感发展、承诺和约定
+- 如果新互动摘要中的内容与已有记忆有重叠，去重保留最完整的版本
+- 合并后不超过 10KB
+
+已有记忆：
+{existing_summary}
+
+新互动摘要：
+{new_summaries_combined}"""
+
+    try:
+        result_text = ""
+        for event in client.stream_chat([
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": summary_prompt}
+        ]):
+            if event.get("type") == "content":
+                result_text += event.get("text", "")
+        return result_text.strip()
+    except Exception:
+        # Fallback: concatenate and truncate
+        fallback = existing_summary + "\n\n---\n\n" + new_summaries_combined
+        return fallback[:MAX_SUMMARY_SIZE]
+
+
+def _load_summary_cache() -> Dict[str, Any]:
+    """Load summary cache from history_summary.json."""
+    cache_path = _log_dir / _SUMMARY_CACHE_FILE
+    try:
+        if cache_path.exists():
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {}
+
+
+def _save_summary_cache(summarized_files: List[str], summary: str) -> None:
+    """Save summary cache to history_summary.json."""
+    cache_path = _log_dir / _SUMMARY_CACHE_FILE
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "summarized_files": summarized_files,
+            "summary": summary
+        }
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _load_history_with_summaries(client: ChatClient) -> Tuple[List[Dict[str, Any]], str]:
-    """Load latest conversation and summarize older ones."""
-    log_files = sorted(_log_dir.glob("chat_*.json"), reverse=True)
+    """Load latest conversation and summarize older ones with caching."""
+    log_files = _list_log_files()
     if not log_files:
         return [], ""
 
@@ -776,27 +886,67 @@ def _load_history_with_summaries(client: ChatClient) -> Tuple[List[Dict[str, Any
     except Exception:
         pass
 
-    # Summarize older conversations
-    summaries: List[str] = []
-    for log_file in log_files[1:]:
+    # Check if latest log exceeds size limit — if so, treat it as old and start fresh
+    if _messages_size(latest_messages) > MAX_LOG_SIZE:
+        older_files = log_files  # all files become "old", including latest
+        latest_messages = []
+    else:
+        older_files = log_files[1:]
+    if not older_files:
+        return latest_messages, ""
+
+    older_file_names = [f.name for f in older_files]
+
+    # Check cache
+    cache = _load_summary_cache()
+    cached_files = cache.get("summarized_files", [])
+    cached_summary = cache.get("summary", "")
+
+    if cached_files == older_file_names and cached_summary:
+        # Cache is up to date
+        return latest_messages, cached_summary
+
+    # Find new files not in cache
+    cached_set = set(cached_files)
+    new_files = [f for f in older_files if f.name not in cached_set]
+
+    if not new_files and cached_summary:
+        # Some files were removed but no new ones — just use cached summary
+        _save_summary_cache(older_file_names, cached_summary)
+        return latest_messages, cached_summary
+
+    # Summarize new files
+    new_summaries: List[str] = []
+    for log_file in new_files:
         try:
             data = json.loads(log_file.read_text(encoding="utf-8"))
             messages = data.get("messages", [])
             if messages:
                 summary = _summarize_conversation(client, messages)
                 if summary:
-                    # Truncate if too long
                     if len(summary) > MAX_SUMMARY_SIZE:
                         summary = summary[:MAX_SUMMARY_SIZE]
-                    summaries.append(f"[{log_file.stem}]\n{summary}")
+                    new_summaries.append(f"[{log_file.stem}]\n{summary}")
         except Exception:
             continue
 
-    # Combine summaries
-    combined_summary = ""
-    if summaries:
-        combined_summary = _summarize_all_summaries(client, summaries)
-        if len(combined_summary) > MAX_SUMMARY_SIZE:
-            combined_summary = combined_summary[:MAX_SUMMARY_SIZE]
+    # Combine with existing cache
+    if cached_summary and new_summaries:
+        # Incremental update: merge existing summary with new summaries
+        combined_summary = _merge_summary_with_new(client, cached_summary, new_summaries)
+    elif cached_summary:
+        combined_summary = cached_summary
+    elif new_summaries:
+        # No cache, summarize all
+        combined_summary = _summarize_all_summaries(client, new_summaries)
+    else:
+        combined_summary = ""
+
+    if len(combined_summary) > MAX_SUMMARY_SIZE:
+        combined_summary = combined_summary[:MAX_SUMMARY_SIZE]
+
+    # Save cache
+    if combined_summary:
+        _save_summary_cache(older_file_names, combined_summary)
 
     return latest_messages, combined_summary

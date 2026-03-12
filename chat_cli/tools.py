@@ -85,7 +85,17 @@ _ACT_TOOL = Tool(
 )
 
 
-AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _FAREWELL_TOOL, _ACT_TOOL]
+_NOOP_TOOL = Tool(
+    name="noop",
+    description="表示你没有任何反应——不说话、不动作、不回应。只有当你确实不想做任何事情时才调用。",
+    parameters={
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+)
+
+AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _FAREWELL_TOOL, _ACT_TOOL, _NOOP_TOOL]
 
 _YEAR_OVERRIDE_FILE = Path("get_current_time.year")
 
@@ -166,6 +176,9 @@ def execute_tool(name: str, arguments_json: str) -> str:
     if name == _ACT_TOOL.name:
         arguments = _parse_arguments(arguments_json)
         return _execute_act(arguments)
+
+    if name == _NOOP_TOOL.name:
+        return json.dumps({"noop": True})
 
     raise ToolError(f"Unknown tool: {name}")
 
