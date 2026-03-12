@@ -70,6 +70,16 @@ _active_profile: Optional[Profile] = None
 _log_dir: Path = DEFAULT_LOG_DIR
 
 
+def _ai_name() -> str:
+    if _active_profile:
+        return _active_profile.name
+    return "AI"
+
+
+def _ai_label() -> str:
+    return f"{_ai_name()}>"
+
+
 def _generate_log_path() -> Path:
     """Generate a log file path with timestamp."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -284,7 +294,7 @@ def _handle_assistant_interaction(
     awaiting_final = True
 
     while awaiting_final:
-        ai_label = style("AI>", AI_COLOR, use_color)
+        ai_label = style(_ai_label(), AI_COLOR, use_color)
         print(f"{ai_label} ", end="", flush=True)
         if use_color:
             print(AI_COLOR, end="", flush=True)
@@ -396,7 +406,7 @@ def _print_system_event(content: str, use_color: bool) -> None:
 
 
 def _print_act_result(result_json: str, use_color: bool) -> None:
-    """Print act tool result in AI Action> / AI Speech> format."""
+    """Print act tool result in name do> / name say> format."""
     try:
         data = json.loads(result_json)
         act_result = data.get("act_result", "")
@@ -406,10 +416,10 @@ def _print_act_result(result_json: str, use_color: bool) -> None:
     for line in act_result.split("\n"):
         if line.startswith("[动作] "):
             action = line[5:]
-            print(f"{style('AI Action>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
+            print(f"{style(f'{_ai_name()} do>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
         elif line.startswith("[说话] "):
             speech = line[5:]
-            print(f"{style('AI Speech>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
+            print(f"{style(f'{_ai_name()} say>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
 
 
 def _print_time_result(result_json: str, use_color: bool) -> None:
@@ -456,7 +466,7 @@ def _print_farewell_result(result_json: str, use_color: bool) -> None:
 
 
 def _print_act_call(arguments_json: str, use_color: bool) -> None:
-    """Print act tool call in AI Action> / AI Speech> format from call arguments."""
+    """Print act tool call in name do> / name say> format from call arguments."""
     try:
         args = json.loads(arguments_json)
     except (json.JSONDecodeError, AttributeError):
@@ -464,9 +474,9 @@ def _print_act_call(arguments_json: str, use_color: bool) -> None:
     action = args.get("action", "")
     speech = args.get("speech", "")
     if action:
-        print(f"{style('AI Action>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
+        print(f"{style(f'{_ai_name()} do>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
     if speech:
-        print(f"{style('AI Speech>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
+        print(f"{style(f'{_ai_name()} say>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
 
 
 def _process_tool_calls(
@@ -561,7 +571,7 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
                 _print_ts(ts, use_color)
         elif role == "assistant":
             if content:
-                print(f"{style('AI>', AI_COLOR, use_color)} {style(content, AI_COLOR, use_color)}")
+                print(f"{style(_ai_label(), AI_COLOR, use_color)} {style(content, AI_COLOR, use_color)}")
             if "tool_calls" in msg:
                 for tc in msg["tool_calls"]:
                     func = tc.get("function", {})
@@ -608,8 +618,9 @@ def _resolve_config_path(provided_path: Optional[Path]) -> Path:
     return ensure_config_file(None)
 
 
-def _write_last_log(session: ChatSession, path: Path) -> None:
-    payload = {"messages": session.messages}
+def _write_log_to_path(messages: List[Dict[str, Any]], path: Path) -> None:
+    """Write messages to a JSON log file and its human-readable companion."""
+    payload = {"messages": messages}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -623,7 +634,7 @@ def _write_last_log(session: ChatSession, path: Path) -> None:
         buf = io.StringIO()
         old_stdout = sys.stdout
         sys.stdout = buf
-        _replay_history(session.messages, use_color=False, show_separator=False)
+        _replay_history(messages, use_color=False, show_separator=False)
         sys.stdout = old_stdout
         readable_path.write_text(buf.getvalue(), encoding="utf-8")
     except Exception as exc:  # pragma: no cover - best-effort
@@ -631,22 +642,45 @@ def _write_last_log(session: ChatSession, path: Path) -> None:
         print(f"Failed to write readable log to {readable_path}: {exc}", file=sys.stderr)
 
 
-def _get_log_path_for_session(session: ChatSession) -> Path:
-    """Get appropriate log path - reuse latest if small, otherwise create new."""
+def _write_last_log(session: ChatSession, path: Path) -> None:
+    """Save session to log, splitting into a new file if over MAX_LOG_SIZE."""
+    messages = session.messages
+
     # Calculate total content size
     total_size = 0
-    for msg in session.messages:
+    for msg in messages:
         content = msg.get("content", "")
         if isinstance(content, str):
             total_size += len(content)
 
-    # If small enough, reuse latest log file
     if total_size <= MAX_LOG_SIZE:
-        log_files = sorted(_log_dir.glob("chat_*.json"), reverse=True)
-        if log_files:
-            return log_files[0]
+        _write_log_to_path(messages, path)
+        return
 
-    # Otherwise create new file
+    # Over limit: figure out how many messages the previous file already has
+    prev_count = 0
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            prev_count = len(data.get("messages", []))
+        except Exception:
+            pass
+
+    if prev_count > 0 and prev_count < len(messages):
+        # Save the old portion back (unchanged) and new portion to a new file
+        _write_log_to_path(messages[:prev_count], path)
+        new_path = _generate_log_path()
+        _write_log_to_path(messages[prev_count:], new_path)
+    else:
+        # No previous file or nothing to split — write everything
+        _write_log_to_path(messages, path)
+
+
+def _get_log_path_for_session(session: ChatSession) -> Path:
+    """Get the latest log file path, or create a new one if none exists."""
+    log_files = sorted(_log_dir.glob("chat_*.json"), reverse=True)
+    if log_files:
+        return log_files[0]
     return _generate_log_path()
 
 
