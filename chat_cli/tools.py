@@ -35,7 +35,7 @@ class ToolError(RuntimeError):
 
 
 _CURRENT_TIME_TOOL = Tool(
-    name="get_current_time",
+    name="check_the_time",
     description="Return the current time in ISO 8601 format. Optionally accept an IANA timezone.",
     parameters={
         "type": "object",
@@ -43,21 +43,6 @@ _CURRENT_TIME_TOOL = Tool(
             "timezone": {
                 "type": "string",
                 "description": "Optional timezone name (e.g. 'UTC' or 'America/New_York')",
-            }
-        },
-        "additionalProperties": False,
-    },
-)
-
-_FAREWELL_TOOL = Tool(
-    name="register_farewell",
-    description="Mark that the user has initiated a farewell so the session can end gracefully.",
-    parameters={
-        "type": "object",
-        "properties": {
-            "note": {
-                "type": "string",
-                "description": "Optional note about the farewell context",
             }
         },
         "additionalProperties": False,
@@ -95,11 +80,10 @@ _NOOP_TOOL = Tool(
     },
 )
 
-AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _FAREWELL_TOOL, _ACT_TOOL, _NOOP_TOOL]
+AVAILABLE_TOOLS: List[Tool] = [_CURRENT_TIME_TOOL, _ACT_TOOL, _NOOP_TOOL]
 
-_YEAR_OVERRIDE_FILE = Path("get_current_time.year")
+_YEAR_OVERRIDE_FILE = Path("check_the_time.year")
 
-_farewell_requested = False
 _is_face_to_face = False
 _act_call_count = 0
 MAX_ACT_CALLS_PER_TURN = 5
@@ -168,10 +152,6 @@ def execute_tool(name: str, arguments_json: str) -> str:
         current_time, tz_name = _current_time(timezone_name)
         payload = {"current_time": current_time, "timezone": tz_name}
         return json.dumps(payload)
-
-    if name == _FAREWELL_TOOL.name:
-        arguments = _parse_arguments(arguments_json)
-        return _register_farewell(arguments)
 
     if name == _ACT_TOOL.name:
         arguments = _parse_arguments(arguments_json)
@@ -253,21 +233,6 @@ def _apply_year_override(iso_time: str, year: str) -> str:
     return iso_time
 
 
-def _register_farewell(arguments: Dict[str, Any]) -> str:
-    global _farewell_requested
-    if _is_face_to_face:
-        # 静默忽略，不设置退出标记
-        return json.dumps({"farewell_registered": False, "reason": "见面时不能说再见"})
-    note = arguments.get("note")
-    if note is not None and not isinstance(note, str):
-        raise ToolError("'note' must be a string if provided")
-    _farewell_requested = True
-    payload: Dict[str, Any] = {"farewell_registered": True}
-    if note:
-        payload["note"] = note
-    return json.dumps(payload)
-
-
 def _execute_act(arguments: Dict[str, Any]) -> str:
     """Execute act tool for agent."""
     global _act_call_count
@@ -276,7 +241,7 @@ def _execute_act(arguments: Dict[str, Any]) -> str:
         raise ToolError("现在不在一起，无法使用 act 工具")
 
     if _act_call_count >= MAX_ACT_CALLS_PER_TURN:
-        raise ToolError(f"一次交互最多只能调用 {MAX_ACT_CALLS_PER_TURN} 次 act 工具，请等待用户回应后再继续行动")
+        return json.dumps({"act_overflow": True})
 
     action = arguments.get("action")
     if not action or not isinstance(action, str):
@@ -294,14 +259,6 @@ def _execute_act(arguments: Dict[str, Any]) -> str:
         result = f"[动作] {action}"
 
     return json.dumps({"act_result": result}, ensure_ascii=False)
-
-
-def consume_farewell_request() -> bool:
-    global _farewell_requested
-    if _farewell_requested:
-        _farewell_requested = False
-        return True
-    return False
 
 
 def handle_face2face(scene: str) -> str:

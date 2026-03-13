@@ -96,6 +96,7 @@ class ChatClient:
         messages: List[Dict[str, Any]],
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
+        max_tokens: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
         # Embed 'ts' field into message content so the API can see timestamps
         api_messages = []
@@ -114,6 +115,9 @@ class ChatClient:
             "messages": api_messages,
             "temperature": self._config.temperature,
         }
+
+        if max_tokens is not None:
+            request["max_tokens"] = max_tokens
 
         prepared_tools = self._prepare_tools(tools)
         if prepared_tools:

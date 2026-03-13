@@ -13,7 +13,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from .chat import ChatSession
 from .client import APIError, ChatClient
 from .config import ConfigError, DEFAULT_CONFIG_PATH, Profile, load_config, load_profile, list_profiles
-from .tools import ToolError, consume_farewell_request, execute_tool, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count
+from .tools import ToolError, execute_tool, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.formatted_text import ANSI
@@ -287,9 +287,6 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                 _restore_history(session, history_checkpoint)
                 continue
 
-            if consume_farewell_request():
-                break
-
         print("Goodbye!")
         return 0
     finally:
@@ -326,7 +323,7 @@ def _handle_assistant_interaction(
             if clean_reply:
                 msg["content"] = clean_reply
             session.add_message(msg)
-            _process_tool_calls(session, tool_calls, use_color)
+            awaiting_final = _process_tool_calls(session, tool_calls, use_color)
         else:
             if clean_reply:
                 session.add_message({"role": "assistant", "content": clean_reply, "ts": ts})
@@ -436,7 +433,7 @@ def _print_act_result(result_json: str, use_color: bool) -> None:
 
 
 def _print_time_result(result_json: str, use_color: bool) -> None:
-    """Print get_current_time result in a clean format."""
+    """Print check_the_time result in a clean format."""
     try:
         data = json.loads(result_json)
         time_str = data.get("current_time", "")
@@ -464,20 +461,6 @@ def _get_tool_name_for_result(tool_msg: Dict[str, Any], messages: List[Dict[str,
     return ""
 
 
-def _print_farewell_result(result_json: str, use_color: bool) -> None:
-    """Print register_farewell result in a clean format."""
-    try:
-        data = json.loads(result_json)
-        registered = data.get("farewell_registered", False)
-        if registered:
-            print(style("  👋 告别", DIM + TOOL_COLOR, use_color))
-        else:
-            reason = data.get("reason", "")
-            print(style(f"  👋 告别被拒绝：{reason}", DIM + TOOL_COLOR, use_color))
-    except (json.JSONDecodeError, AttributeError):
-        print(style(f"  👋 {result_json}", DIM + TOOL_COLOR, use_color))
-
-
 def _print_act_call(arguments_json: str, use_color: bool) -> None:
     """Print act tool call in name do> / name say> format from call arguments."""
     try:
@@ -496,14 +479,20 @@ def _process_tool_calls(
     session: ChatSession,
     tool_calls: List[Dict[str, Any]],
     use_color: bool,
-) -> None:
+) -> bool:
+    """Process tool calls and return whether to continue awaiting LLM response.
+
+    Returns True if another LLM round-trip is needed, False if the interaction
+    should end immediately (e.g. noop called, or act overflow reached).
+    """
+    should_continue = True
     for tool_call in tool_calls:
         function_data = tool_call.get("function", {})
         name = function_data.get("name", "")
         arguments = function_data.get("arguments", "")
         tool_id = tool_call.get("id", "")
 
-        if name in ("act", "get_current_time", "register_farewell", "noop"):
+        if name in ("act", "check_the_time", "noop"):
             pass
         else:
             invocation = f"[tool-call] {name}({arguments})"
@@ -521,19 +510,26 @@ def _process_tool_calls(
                 raise
             continue
 
-        session.add_tool_message(tool_id, result)
-
-        if name == "act":
-            _print_act_result(result, use_color)
-        elif name == "get_current_time":
-            _print_time_result(result, use_color)
-        elif name == "register_farewell":
-            _print_farewell_result(result, use_color)
-        elif name == "noop":
+        if name == "noop":
             print(f"{style(_ai_label(), DIM + AI_COLOR, use_color)} {style('...', DIM + AI_COLOR, use_color)}")
+            should_continue = False
+            continue
+        elif name == "act":
+            parsed = json.loads(result)
+            if parsed.get("act_overflow"):
+                should_continue = False
+                continue
+            session.add_tool_message(tool_id, result)
+            _print_act_result(result, use_color)
         else:
-            output_line = f"[tool-result] {result}"
-            print(style(output_line, TOOL_COLOR, use_color))
+            session.add_tool_message(tool_id, result)
+            if name == "check_the_time":
+                _print_time_result(result, use_color)
+            else:
+                output_line = f"[tool-result] {result}"
+                print(style(output_line, TOOL_COLOR, use_color))
+
+    return should_continue
 
 
 def _restore_history(session: ChatSession, checkpoint: int) -> None:
@@ -596,7 +592,7 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
                         _print_act_call(arguments, use_color)
                     elif name == "noop":
                         print(f"{style(_ai_label(), DIM + AI_COLOR, use_color)} {style('...', DIM + AI_COLOR, use_color)}")
-                    elif name in ("get_current_time", "register_farewell"):
+                    elif name == "check_the_time":
                         pass  # result will be shown in tool message
                     else:
                         print(style(f"[tool-call] {name}({arguments})", TOOL_COLOR, use_color))
@@ -614,11 +610,8 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
                 except (json.JSONDecodeError, AttributeError):
                     pass
                 continue
-            elif tool_name == "get_current_time":
+            elif tool_name == "check_the_time":
                 _print_time_result(content, use_color)
-                continue
-            elif tool_name == "register_farewell":
-                _print_farewell_result(content, use_color)
                 continue
             elif tool_name == "noop":
                 continue  # already shown via tool_calls
@@ -718,6 +711,10 @@ def _load_last_log() -> List[Dict[str, Any]]:
 
 
 MAX_SUMMARY_SIZE = 10000  # 10K characters per summary
+_SUMMARY_MAX_TOKENS = 16384  # enough for ~10K Chinese characters
+_SCENE_SPLIT_THRESHOLD = 30000  # split into scenes when rendered text exceeds this
+_SCENE_TIME_GAP_MINUTES = 30  # time gap to start a new scene
+_SCENE_MIN_MESSAGES = 5  # merge scenes shorter than this
 
 _SUMMARY_SYSTEM_PROMPT = "你是一个互动记录摘要助手。你的任务是为角色扮演聊天生成摘要，帮助 AI 角色在下次互动时快速回忆之前发生了什么。"
 
@@ -737,27 +734,73 @@ def _render_messages_to_text(messages: List[Dict[str, Any]]) -> str:
     return buf.getvalue()
 
 
-def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) -> str:
-    """Use LLM to summarize a conversation using good4read format."""
-    # Filter out initial system prompt, keep system events
-    dialog_messages = []
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "system" and i == 0 and "[系统事件]" not in msg.get("content", ""):
-            continue
-        dialog_messages.append(msg)
+def _split_into_scenes(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    """Split messages into scenes based on system events and time gaps."""
+    if not messages:
+        return []
 
-    conversation_text = _render_messages_to_text(dialog_messages)
-    if not conversation_text.strip():
-        return ""
+    scenes: List[List[Dict[str, Any]]] = [[]]
+    prev_ts: Optional[datetime] = None
 
+    for msg in messages:
+        content = msg.get("content", "") or ""
+        role = msg.get("role", "")
+
+        # Parse timestamp
+        cur_ts = None
+        ts_str = msg.get("ts", "")
+        if ts_str:
+            try:
+                cur_ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
+            except ValueError:
+                pass
+
+        # Check if this is a face-to-face START event
+        is_f2f_start = (
+            role == "system"
+            and "[系统事件]" in content
+            and "见面状态" in content
+        )
+
+        # Check time gap
+        has_time_gap = False
+        if cur_ts and prev_ts:
+            gap_minutes = (cur_ts - prev_ts).total_seconds() / 60
+            has_time_gap = gap_minutes > _SCENE_TIME_GAP_MINUTES
+
+        # Start new scene on face-to-face start or time gap
+        if (is_f2f_start or has_time_gap) and scenes[-1]:
+            scenes.append([])
+
+        scenes[-1].append(msg)
+        if cur_ts:
+            prev_ts = cur_ts
+
+    # Merge short scenes into previous
+    merged: List[List[Dict[str, Any]]] = []
+    for scene in scenes:
+        if merged and len(scene) < _SCENE_MIN_MESSAGES:
+            merged[-1].extend(scene)
+        else:
+            merged.append(scene)
+
+    return merged
+
+
+def _build_summary_prompt(conversation_text: str) -> str:
+    """Build the summary prompt for a conversation or scene."""
     ai_name = _ai_name()
-    summary_prompt = f"""请为以下互动记录生成摘要。摘要将作为 AI 角色的"记忆"注入到下次互动中。
+    return f"""请为以下互动记录生成详细的时间线摘要。摘要将作为 AI 角色的"记忆"注入到下次互动中，必须足够详细以便角色能准确回忆发生过的事。
 
 要求：
+- 按时间顺序组织，用 **时间段标题**（如"上午 10:35-10:41"）分隔
+- 每个时间段内列出关键事件：谁说了什么重要的话、做了什么、发生了什么
+- 保留重要的对话内容（承诺、约定、告白、争吵、调情的具体内容）
+- 保留情感变化和关系发展
+- 记录见面/分开事件及场景
+- 记录提到的其他人物及相关信息
+- 不要省略任何重要事件，宁可详细也不要遗漏
 - 用第三人称叙述（"用户做了什么"、"角色做了什么"）
-- 保留关键事件、情感变化、重要承诺或约定
-- 保留时间信息（大约几点发生了什么）
-- 如果有见面/分开事件（系统事件），注明
 - 摘要不超过 10KB
 
 格式说明：
@@ -771,17 +814,63 @@ def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) 
 互动记录：
 {conversation_text}"""
 
+
+def _call_summary_llm(client: ChatClient, prompt: str) -> str:
+    """Call LLM to generate a summary. Returns empty string on failure."""
     try:
         result_text = ""
         for event in client.stream_chat([
             {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": summary_prompt}
-        ]):
+            {"role": "user", "content": prompt}
+        ], max_tokens=_SUMMARY_MAX_TOKENS):
             if event.get("type") == "content":
                 result_text += event.get("text", "")
         return result_text.strip()
     except Exception:
         return ""
+
+
+def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) -> str:
+    """Use LLM to summarize a conversation, splitting into scenes if too long."""
+    # Filter out initial system prompt, keep system events
+    dialog_messages = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system" and i == 0 and "[系统事件]" not in msg.get("content", ""):
+            continue
+        dialog_messages.append(msg)
+
+    conversation_text = _render_messages_to_text(dialog_messages)
+    if not conversation_text.strip():
+        return ""
+
+    # Short conversation: summarize in one shot
+    if len(conversation_text) <= _SCENE_SPLIT_THRESHOLD:
+        return _call_summary_llm(client, _build_summary_prompt(conversation_text))
+
+    # Long conversation: split into scenes and summarize each
+    scenes = _split_into_scenes(dialog_messages)
+    if len(scenes) <= 1:
+        # Could not split further, fall back to single summary
+        return _call_summary_llm(client, _build_summary_prompt(conversation_text))
+
+    scene_summaries: List[str] = []
+    for idx, scene in enumerate(scenes, 1):
+        scene_text = _render_messages_to_text(scene)
+        if not scene_text.strip():
+            continue
+        summary = _call_summary_llm(client, _build_summary_prompt(scene_text))
+        if summary:
+            scene_summaries.append(summary)
+
+    if not scene_summaries:
+        return ""
+
+    combined = "\n\n".join(scene_summaries)
+    if len(combined) <= MAX_SUMMARY_SIZE:
+        return combined
+
+    # Too long after combining: merge summaries
+    return _summarize_all_summaries(client, scene_summaries)
 
 
 def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
@@ -793,9 +882,9 @@ def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
     summary_prompt = f"""请将以下多段互动摘要合并为一个整体摘要。这个摘要将作为 AI 角色的"记忆"使用。
 
 要求：
-- 按时间顺序组织
-- 保留重要事件、情感发展、承诺和约定
-- 去除重复信息
+- 严格按时间顺序组织，保留时间段标题
+- 保留所有重要事件、对话内容、情感发展、承诺和约定
+- 去除重复信息，但不要为了精简而丢失细节
 - 合并后不超过 10KB
 
 各段摘要：
@@ -806,7 +895,7 @@ def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
         for event in client.stream_chat([
             {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": summary_prompt}
-        ]):
+        ], max_tokens=_SUMMARY_MAX_TOKENS):
             if event.get("type") == "content":
                 result_text += event.get("text", "")
         return result_text.strip()
@@ -821,9 +910,10 @@ def _merge_summary_with_new(client: ChatClient, existing_summary: str, new_summa
     summary_prompt = f"""以下是之前多次互动的摘要（已有记忆），以及最近几次新互动的摘要。请将它们合并为一个整体摘要，作为 AI 角色的"记忆"使用。
 
 要求：
-- 按时间顺序组织，新内容接续在已有记忆之后
-- 保留重要事件、情感发展、承诺和约定
+- 严格按时间顺序组织，新内容接续在已有记忆之后
+- 保留所有重要事件、对话内容、情感发展、承诺和约定
 - 如果新互动摘要中的内容与已有记忆有重叠，去重保留最完整的版本
+- 不要为了精简而丢失细节
 - 合并后不超过 10KB
 
 已有记忆：
@@ -837,7 +927,7 @@ def _merge_summary_with_new(client: ChatClient, existing_summary: str, new_summa
         for event in client.stream_chat([
             {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
             {"role": "user", "content": summary_prompt}
-        ]):
+        ], max_tokens=_SUMMARY_MAX_TOKENS):
             if event.get("type") == "content":
                 result_text += event.get("text", "")
         return result_text.strip()
