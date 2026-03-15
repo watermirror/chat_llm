@@ -11,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import cnlunar
+
 _summary_logger = logging.getLogger("chat_cli.summary")
 
 from .chat import ChatSession
@@ -49,12 +51,42 @@ def _prompt_style(text: str, color: str, enable: bool) -> str:
 EXIT_COMMANDS = {"/quit", "/exit", "/q"}
 
 
+_WEEKDAYS_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
 def _now_ts() -> str:
-    """Return current timestamp in YYYY-MM-DD HH:MM format."""
-    return datetime.now().strftime("%Y-%m-%d %H:%M")
+    """Return current timestamp with weekday, lunar date, and festivals/solar terms.
+
+    Format: 'YYYY-MM-DD HH:MM:SS 周X 农历X月X日[ 节气/节日]'
+    Example: '2026-02-17 09:30:00 周二 农历正月初一 春节'
+    """
+    now = datetime.now()
+    weekday = _WEEKDAYS_CN[now.weekday()]
+    base = now.strftime(f"%Y-%m-%d %H:%M:%S {weekday}")
+
+    lunar = cnlunar.Lunar(now)
+    # Clean month name: "正月大" -> "正月"
+    month = lunar.lunarMonthCn.rstrip("大小")
+    lunar_str = f"农历{month}{lunar.lunarDayCn}"
+
+    # Collect festival/solar term tags (deduplicated)
+    tags: List[str] = []
+    solar_term = lunar.todaySolarTerms
+    if solar_term and solar_term != "无":
+        tags.append(solar_term)
+    legal = lunar.get_legalHolidays()
+    if legal and legal not in tags:
+        tags.append(legal)
+    other = lunar.get_otherHolidays()
+    if other and not legal and other not in tags:
+        tags.append(other)
+
+    suffix = f" {' '.join(tags)}" if tags else ""
+    return f"{base} {lunar_str}{suffix}"
 
 
-_TS_PATTERN = re.compile(r"\s*<\d{4}-\d{2}-\d{2} \d{2}:\d{2}>\s*$")
+# Match timestamp tags: old format, weekday-only, or full with lunar date/festivals
+_TS_PATTERN = re.compile(r"\s*<\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?[^>]*>\s*$")
 
 
 def _print_ts(ts: str, use_color: bool) -> None:
@@ -751,7 +783,7 @@ _SUMMARY_FORMAT_RULES = """\
 - "我>" 是你自己的发言
 - "我 do>" 是你的动作
 - "我 say>" 是你做动作时同时说的话
-- "─── 时间 ───" 是时间戳
+- "─── 时间 ───" 是时间戳，格式包含公历、星期、农历日期，可能附带节气或节日
 - "[系统事件]" 是系统事件（见面/分开等）"""
 
 _SUMMARY_CONTENT_RULES = """\
@@ -804,13 +836,19 @@ def _split_into_scenes(messages: List[Dict[str, Any]]) -> List[List[Dict[str, An
         content = msg.get("content", "") or ""
         role = msg.get("role", "")
 
-        # Parse timestamp
+        # Parse timestamp (supports old/new formats with optional weekday/lunar)
         cur_ts = None
         ts_str = msg.get("ts", "")
         if ts_str:
-            try:
-                cur_ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
-            except ValueError:
+            # Strip everything after seconds or minutes (weekday, lunar, festivals)
+            ts_clean = re.sub(r"(\d{2}:\d{2}(?::\d{2})?).*", r"\1", ts_str)
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    cur_ts = datetime.strptime(ts_clean, fmt)
+                    break
+                except ValueError:
+                    continue
+            if cur_ts is None:
                 pass
 
         # Check if this is a face-to-face START event
