@@ -1,10 +1,10 @@
 """Configuration management for the chat CLI."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 try:  # Python 3.11+
     import tomllib as _tomllib
@@ -26,6 +26,17 @@ class ConfigError(Exception):
 
 
 @dataclass
+class LLMConfig:
+    """Configuration for a single LLM endpoint."""
+
+    api_url: str
+    api_key: str
+    model: str
+    temperature: float
+    max_tokens: Optional[int] = None
+
+
+@dataclass
 class Config:
     """Strongly typed configuration values for the chat client."""
 
@@ -33,6 +44,37 @@ class Config:
     api_key: str
     model: str
     temperature: float
+    max_tokens: Optional[int] = None
+    max_retries: int = 0
+    fallback_api_url: Optional[str] = None
+    fallback_api_key: Optional[str] = None
+    fallback_model: Optional[str] = None
+    fallback_temperature: Optional[float] = None
+    fallback_max_tokens: Optional[int] = None
+
+    @property
+    def primary_llm(self) -> LLMConfig:
+        return LLMConfig(self.api_url, self.api_key, self.model, self.temperature, self.max_tokens)
+
+    @property
+    def fallback_llm(self) -> Optional[LLMConfig]:
+        if not self.fallback_api_url or not self.fallback_api_key:
+            return None
+        return LLMConfig(
+            api_url=self.fallback_api_url,
+            api_key=self.fallback_api_key,
+            model=self.fallback_model or self.model,
+            temperature=self.fallback_temperature if self.fallback_temperature is not None else self.temperature,
+            max_tokens=self.fallback_max_tokens,
+        )
+
+    @property
+    def llm_chain(self) -> List[LLMConfig]:
+        """Return [primary] or [primary, fallback] depending on configuration."""
+        chain = [self.primary_llm]
+        if self.fallback_llm:
+            chain.append(self.fallback_llm)
+        return chain
 
 
 # Profile directories
@@ -137,11 +179,43 @@ def load_config(path: Path | None = None) -> Config:
     except (TypeError, ValueError) as exc:
         raise ConfigError("temperature must be a number") from exc
 
+    max_tokens: Optional[int] = None
+    if "max_tokens" in merged:
+        try:
+            max_tokens = int(merged["max_tokens"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("max_tokens must be an integer") from exc
+
+    max_retries = int(merged.get("max_retries", 0))
+
+    fallback_api_url = merged.get("fallback_api_url")
+    fallback_api_key = merged.get("fallback_api_key")
+    fallback_model = merged.get("fallback_model")
+    fallback_temperature: Optional[float] = None
+    if "fallback_temperature" in merged:
+        try:
+            fallback_temperature = float(merged["fallback_temperature"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("fallback_temperature must be a number") from exc
+    fallback_max_tokens: Optional[int] = None
+    if "fallback_max_tokens" in merged:
+        try:
+            fallback_max_tokens = int(merged["fallback_max_tokens"])
+        except (TypeError, ValueError) as exc:
+            raise ConfigError("fallback_max_tokens must be an integer") from exc
+
     return Config(
         api_url=str(merged["api_url"]),
         api_key=str(merged["api_key"]),
         model=str(merged["model"]),
         temperature=temperature,
+        max_tokens=max_tokens,
+        max_retries=max_retries,
+        fallback_api_url=str(fallback_api_url) if fallback_api_url else None,
+        fallback_api_key=str(fallback_api_key) if fallback_api_key else None,
+        fallback_model=str(fallback_model) if fallback_model else None,
+        fallback_temperature=fallback_temperature,
+        fallback_max_tokens=fallback_max_tokens,
     )
 
 

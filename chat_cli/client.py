@@ -20,7 +20,7 @@ except ImportError as exc:  # pragma: no cover
         "The pydantic package is required. Install it with `pip install pydantic`."
     ) from exc
 
-from .config import Config
+from .config import Config, LLMConfig
 
 
 class APIError(RuntimeError):
@@ -84,7 +84,7 @@ class _ToolBuffer:
 class ChatClient:
     """Chat completion client backed by the OpenAI SDK."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config | LLMConfig) -> None:
         self._config = config
         self._client = OpenAI(
             api_key=config.api_key,
@@ -166,7 +166,9 @@ class ChatClient:
                         yield buffer.to_event()
                     tool_buffers.clear()
 
-                if any(reason for reason in finish_reasons if reason and reason != "tool_calls"):
+                non_tool_reasons = [r for r in finish_reasons if r and r != "tool_calls"]
+                if non_tool_reasons:
+                    yield {"type": "finish", "finish_reason": non_tool_reasons[0]}
                     break
         finally:
             close = getattr(stream, "close", None)
@@ -200,6 +202,10 @@ class ChatClient:
                         },
                     },
                 }
+
+            finish_reason = getattr(choice, "finish_reason", None)
+            if finish_reason:
+                yield {"type": "finish", "finish_reason": finish_reason}
 
     @staticmethod
     def _should_retry_without_stream(message: str) -> bool:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 
@@ -10,9 +11,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+_summary_logger = logging.getLogger("chat_cli.summary")
+
 from .chat import ChatSession
 from .client import APIError, ChatClient
-from .config import ConfigError, DEFAULT_CONFIG_PATH, Profile, load_config, load_profile, list_profiles
+from .config import Config, ConfigError, DEFAULT_CONFIG_PATH, Profile, load_config, load_profile, list_profiles
 from .tools import ToolError, execute_tool, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count
 
 from prompt_toolkit import prompt as pt_prompt
@@ -80,6 +83,15 @@ def _ai_label() -> str:
     return f"{_ai_name()}>"
 
 
+def _setup_summary_logger(log_dir: Path) -> None:
+    """Configure summary logger to write to log_dir/summary.log."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(log_dir / "summary.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    _summary_logger.addHandler(handler)
+    _summary_logger.setLevel(logging.DEBUG)
+
+
 _LOG_NAME_PATTERN = re.compile(r"^chat_\d{8}_\d{6}\.json$")
 
 
@@ -144,6 +156,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         _log_dir.mkdir(parents=True, exist_ok=True)
         system_prompt = profile.system_prompt
 
+    # Setup summary logger to write to log_dir/summary.log
+    _setup_summary_logger(_log_dir)
+
     # Initialize face-to-face state from file (use profile path if available)
     init_face_to_face_state(profile_path)
 
@@ -161,7 +176,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         use_color = sys.stdout.isatty() and not args.no_color
 
         # Load previous conversation with summaries
-        previous_messages, history_summary = _load_history_with_summaries(client)
+        previous_messages, history_summary = _load_history_with_summaries(config)
 
         # Create session with system prompt, history summary and face-to-face state
         session = ChatSession(
@@ -711,18 +726,54 @@ def _load_last_log() -> List[Dict[str, Any]]:
 
 
 MAX_SUMMARY_SIZE = 10000  # 10K characters per summary
-_SUMMARY_MAX_TOKENS = 16384  # enough for ~10K Chinese characters
+_SUMMARY_MAX_TOKENS = 16384  # default, can be overridden per-LLM in config
 _SCENE_SPLIT_THRESHOLD = 30000  # split into scenes when rendered text exceeds this
+_BATCH_TEXT_LIMIT = 20000  # max chars of scene text per LLM call
 _SCENE_TIME_GAP_MINUTES = 30  # time gap to start a new scene
 _SCENE_MIN_MESSAGES = 5  # merge scenes shorter than this
 
-_SUMMARY_SYSTEM_PROMPT = "你是一个互动记录摘要助手。你的任务是为角色扮演聊天生成摘要，帮助 AI 角色在下次互动时快速回忆之前发生了什么。"
+_SUMMARY_SYSTEM_PROMPT = (
+    "你是一个互动记录摘要助手。你的任务是为角色扮演聊天生成摘要，"
+    "帮助 AI 角色在下次互动时快速回忆之前发生过的事。"
+)
+
+_SUMMARY_PERSPECTIVE_RULES = """\
+视角规则（非常重要）：
+- 你就是这个角色本人，用"我"称呼自己，用"水镜"称呼用户
+- 只记录你**清醒时亲身经历或感知到的事件**
+- 如果记录中显示你处于睡着、昏迷、失去意识等状态，那段时间内其他人做的事你不应该知道——除非事后有人明确告诉了你
+- 你离开现场后发生的事，你同样不应该知道——除非有人转述
+- 对于你无法感知的事件，不要写入摘要"""
+
+_SUMMARY_FORMAT_RULES = """\
+格式说明：
+- "水镜>" 是用户（水镜）的发言
+- "我>" 是你自己的发言
+- "我 do>" 是你的动作
+- "我 say>" 是你做动作时同时说的话
+- "─── 时间 ───" 是时间戳
+- "[系统事件]" 是系统事件（见面/分开等）"""
+
+_SUMMARY_CONTENT_RULES = """\
+内容要求：
+- 按时间顺序组织，用 **时间段标题**（如"上午 10:35-10:41"）分隔
+- 每个时间段内列出关键事件：谁说了什么重要的话、做了什么、发生了什么
+- 保留重要的对话内容（承诺、约定、告白、争吵、调情、提议的具体内容）
+- 保留情感变化和关系发展
+- 记录见面/分开事件及场景
+- 记录提到的其他人物及相关信息
+- 不要省略任何重要事件"""
 
 _SUMMARY_CACHE_FILE = "history_summary.json"
 
 
-def _render_messages_to_text(messages: List[Dict[str, Any]]) -> str:
-    """Render messages to plain text using _replay_history (good4read format)."""
+def _render_messages_to_text(messages: List[Dict[str, Any]], for_summary: bool = False) -> str:
+    """Render messages to plain text using _replay_history (good4read format).
+
+    If for_summary is True, replace labels to match the AI's first-person perspective:
+    - "You>" becomes "水镜>" (the user)
+    - "{ai_name}>" / "{ai_name} do>" / "{ai_name} say>" become "我>" / "我 do>" / "我 say>"
+    """
     import io
     buf = io.StringIO()
     old_stdout = sys.stdout
@@ -731,7 +782,14 @@ def _render_messages_to_text(messages: List[Dict[str, Any]]) -> str:
         _replay_history(messages, use_color=False, show_separator=False)
     finally:
         sys.stdout = old_stdout
-    return buf.getvalue()
+    text = buf.getvalue()
+    if for_summary:
+        ai_name = _ai_name()
+        text = text.replace(f"{ai_name} do>", "我 do>")
+        text = text.replace(f"{ai_name} say>", "我 say>")
+        text = text.replace(f"{ai_name}>", "我>")
+        text = text.replace("You>", "水镜>")
+    return text
 
 
 def _split_into_scenes(messages: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -787,154 +845,255 @@ def _split_into_scenes(messages: List[Dict[str, Any]]) -> List[List[Dict[str, An
     return merged
 
 
-def _build_summary_prompt(conversation_text: str) -> str:
-    """Build the summary prompt for a conversation or scene."""
-    ai_name = _ai_name()
-    return f"""请为以下互动记录生成详细的时间线摘要。摘要将作为 AI 角色的"记忆"注入到下次互动中，必须足够详细以便角色能准确回忆发生过的事。
+def _batch_scenes(scenes: List[List[Dict[str, Any]]], limit: int = _BATCH_TEXT_LIMIT) -> List[str]:
+    """Batch consecutive scenes into text chunks that fit within the limit.
 
-要求：
-- 按时间顺序组织，用 **时间段标题**（如"上午 10:35-10:41"）分隔
-- 每个时间段内列出关键事件：谁说了什么重要的话、做了什么、发生了什么
-- 保留重要的对话内容（承诺、约定、告白、争吵、调情的具体内容）
-- 保留情感变化和关系发展
-- 记录见面/分开事件及场景
-- 记录提到的其他人物及相关信息
-- 不要省略任何重要事件，宁可详细也不要遗漏
-- 用第三人称叙述（"用户做了什么"、"角色做了什么"）
-- 摘要不超过 10KB
+    Returns a list of rendered text strings, each within the limit.
+    If a single scene exceeds the limit, it is truncated to fit.
+    """
+    batches: List[str] = []
+    current_text = ""
+    for scene in scenes:
+        scene_text = _render_messages_to_text(scene, for_summary=True)
+        if not scene_text.strip():
+            continue
+        if not current_text:
+            # First scene in batch — always accept, truncate if needed
+            if len(scene_text) > limit:
+                current_text = scene_text[:limit]
+            else:
+                current_text = scene_text
+        elif len(current_text) + len(scene_text) <= limit:
+            # Fits in current batch
+            current_text += "\n" + scene_text
+        else:
+            # Doesn't fit — flush current batch, start new one
+            batches.append(current_text)
+            if len(scene_text) > limit:
+                current_text = scene_text[:limit]
+            else:
+                current_text = scene_text
+    if current_text.strip():
+        batches.append(current_text)
+    return batches
 
-格式说明：
-- "You>" 是用户发言
-- "{ai_name}>" 是 AI 角色发言
-- "{ai_name} do>" 是角色的动作
-- "{ai_name} say>" 是角色做动作时同时说的话
-- "─── 时间 ───" 是时间戳
-- "[系统事件]" 是系统事件（见面/分开等）
+
+def _build_initial_summary_prompt(character_background: str, conversation_text: str) -> str:
+    """Build prompt for summarizing a scene into the character's memory."""
+    bg_section = ""
+    if character_background:
+        bg_section = f"""你的角色背景（用于理解你是谁，不需要复述）：
+{character_background}
+
+"""
+    return f"""请为以下互动记录生成详细的时间线摘要。摘要将作为你的"记忆"注入到下次互动中，必须足够详细以便你能准确回忆发生过的事。
+
+{bg_section}{_SUMMARY_PERSPECTIVE_RULES}
+
+{_SUMMARY_CONTENT_RULES}
+
+{_SUMMARY_FORMAT_RULES}
 
 互动记录：
 {conversation_text}"""
 
 
-def _call_summary_llm(client: ChatClient, prompt: str) -> str:
-    """Call LLM to generate a summary. Returns empty string on failure."""
-    try:
-        result_text = ""
-        for event in client.stream_chat([
-            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ], max_tokens=_SUMMARY_MAX_TOKENS):
-            if event.get("type") == "content":
-                result_text += event.get("text", "")
-        return result_text.strip()
-    except Exception:
-        return ""
+def _build_merge_prompt(character_background: str, existing_summary: str, new_conversation_text: str) -> str:
+    """Build prompt for merging existing summary with new raw conversation."""
+    bg_section = ""
+    if character_background:
+        bg_section = f"""你的角色背景（用于理解你是谁，不需要复述）：
+{character_background}
 
+"""
+    return f"""以下是你之前的记忆摘要，以及一段新的互动记录原文。请将新的互动内容整合到已有记忆中，生成更新后的完整摘要。
 
-def _summarize_conversation(client: ChatClient, messages: List[Dict[str, Any]]) -> str:
-    """Use LLM to summarize a conversation, splitting into scenes if too long."""
-    # Filter out initial system prompt, keep system events
-    dialog_messages = []
-    for i, msg in enumerate(messages):
-        if msg.get("role") == "system" and i == 0 and "[系统事件]" not in msg.get("content", ""):
-            continue
-        dialog_messages.append(msg)
+{bg_section}{_SUMMARY_PERSPECTIVE_RULES}
 
-    conversation_text = _render_messages_to_text(dialog_messages)
-    if not conversation_text.strip():
-        return ""
+{_SUMMARY_CONTENT_RULES}
 
-    # Short conversation: summarize in one shot
-    if len(conversation_text) <= _SCENE_SPLIT_THRESHOLD:
-        return _call_summary_llm(client, _build_summary_prompt(conversation_text))
+整合要求：
+- 将新互动内容按时间顺序接续在已有记忆之后
+- 如果新内容与已有记忆有重叠，去重保留最完整的版本
+- 不要为了精简而丢失已有记忆中的细节
+- 更新后的摘要不超过 10KB
 
-    # Long conversation: split into scenes and summarize each
-    scenes = _split_into_scenes(dialog_messages)
-    if len(scenes) <= 1:
-        # Could not split further, fall back to single summary
-        return _call_summary_llm(client, _build_summary_prompt(conversation_text))
-
-    scene_summaries: List[str] = []
-    for idx, scene in enumerate(scenes, 1):
-        scene_text = _render_messages_to_text(scene)
-        if not scene_text.strip():
-            continue
-        summary = _call_summary_llm(client, _build_summary_prompt(scene_text))
-        if summary:
-            scene_summaries.append(summary)
-
-    if not scene_summaries:
-        return ""
-
-    combined = "\n\n".join(scene_summaries)
-    if len(combined) <= MAX_SUMMARY_SIZE:
-        return combined
-
-    # Too long after combining: merge summaries
-    return _summarize_all_summaries(client, scene_summaries)
-
-
-def _summarize_all_summaries(client: ChatClient, summaries: List[str]) -> str:
-    """Summarize multiple summaries into one if too long."""
-    combined = "\n\n---\n\n".join(summaries)
-    if len(combined) <= MAX_SUMMARY_SIZE:
-        return combined
-
-    summary_prompt = f"""请将以下多段互动摘要合并为一个整体摘要。这个摘要将作为 AI 角色的"记忆"使用。
-
-要求：
-- 严格按时间顺序组织，保留时间段标题
-- 保留所有重要事件、对话内容、情感发展、承诺和约定
-- 去除重复信息，但不要为了精简而丢失细节
-- 合并后不超过 10KB
-
-各段摘要：
-{combined}"""
-
-    try:
-        result_text = ""
-        for event in client.stream_chat([
-            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": summary_prompt}
-        ], max_tokens=_SUMMARY_MAX_TOKENS):
-            if event.get("type") == "content":
-                result_text += event.get("text", "")
-        return result_text.strip()
-    except Exception:
-        return combined[:MAX_SUMMARY_SIZE]
-
-
-def _merge_summary_with_new(client: ChatClient, existing_summary: str, new_summaries: List[str]) -> str:
-    """Merge existing cached summary with new conversation summaries."""
-    new_summaries_combined = "\n\n---\n\n".join(new_summaries)
-
-    summary_prompt = f"""以下是之前多次互动的摘要（已有记忆），以及最近几次新互动的摘要。请将它们合并为一个整体摘要，作为 AI 角色的"记忆"使用。
-
-要求：
-- 严格按时间顺序组织，新内容接续在已有记忆之后
-- 保留所有重要事件、对话内容、情感发展、承诺和约定
-- 如果新互动摘要中的内容与已有记忆有重叠，去重保留最完整的版本
-- 不要为了精简而丢失细节
-- 合并后不超过 10KB
+{_SUMMARY_FORMAT_RULES}
 
 已有记忆：
 {existing_summary}
 
-新互动摘要：
-{new_summaries_combined}"""
+新的互动记录：
+{new_conversation_text}"""
 
-    try:
-        result_text = ""
-        for event in client.stream_chat([
-            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
-            {"role": "user", "content": summary_prompt}
-        ], max_tokens=_SUMMARY_MAX_TOKENS):
-            if event.get("type") == "content":
-                result_text += event.get("text", "")
-        return result_text.strip()
-    except Exception:
-        # Fallback: concatenate and truncate
-        fallback = existing_summary + "\n\n---\n\n" + new_summaries_combined
-        return fallback[:MAX_SUMMARY_SIZE]
+
+def _call_summary_llm(config: Config, prompt: str, label: str = "") -> str:
+    """Call LLM to generate a summary using primary LLM, falling back if configured.
+
+    Tries each LLM in config.llm_chain up to (max_retries + 1) times.
+    Raises RuntimeError if all attempts fail.
+    """
+    tag = f"[{label}] " if label else ""
+    prompt_len = len(prompt)
+    llm_chain = config.llm_chain
+    max_attempts = config.max_retries + 1
+    total_llms = len(llm_chain)
+    _summary_logger.info("%sprompt length: %d chars, %d LLM(s), max_attempts=%d", tag, prompt_len, total_llms, max_attempts)
+
+    last_error: Optional[Exception] = None
+    for llm_idx, llm_config in enumerate(llm_chain):
+        llm_label = "primary" if llm_idx == 0 else "fallback"
+        is_network_error = False
+        attempts = max_attempts
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
+            try:
+                client = ChatClient(llm_config)
+                result_text = ""
+                finish_reason = "unknown"
+                for event in client.stream_chat([
+                    {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt}
+                ], max_tokens=llm_config.max_tokens or _SUMMARY_MAX_TOKENS):
+                    if event.get("type") == "content":
+                        result_text += event.get("text", "")
+                    elif event.get("type") == "finish":
+                        finish_reason = event.get("finish_reason", "unknown")
+                result = result_text.strip()
+                _summary_logger.info(
+                    "%s%s attempt %d/%d: finish_reason=%s, output=%d chars, model=%s",
+                    tag, llm_label, attempt, attempts, finish_reason, len(result), llm_config.model,
+                )
+                if finish_reason == "stop" and result:
+                    if llm_idx > 0:
+                        print(f"  [降级] {tag}使用了 {llm_config.model} (原因: {last_error})")
+                    return result
+                is_network_error = finish_reason == "network_error"
+                if is_network_error and attempts == max_attempts:
+                    attempts = max(max_attempts, 2)  # network error at least retry once
+                _summary_logger.warning(
+                    "%s%s attempt %d/%d failed: finish_reason=%s, output=%d chars",
+                    tag, llm_label, attempt, attempts, finish_reason, len(result),
+                )
+                last_error = RuntimeError(
+                    f"{llm_label} LLM ({llm_config.model}) finish_reason={finish_reason}"
+                )
+            except Exception as exc:
+                _summary_logger.error(
+                    "%s%s attempt %d/%d exception: %s", tag, llm_label, attempt, attempts, exc
+                )
+                last_error = exc
+                # Treat exceptions (connection errors etc.) as network issues
+                if attempts == max_attempts:
+                    attempts = max(max_attempts, 2)
+        _summary_logger.warning("%s%s exhausted %d attempts", tag, llm_label, attempts)
+
+    _summary_logger.error("%sall LLMs exhausted, raising", tag)
+    raise RuntimeError(f"Summary generation failed across all LLMs: {last_error}") from last_error
+
+
+def _summarize_conversation(
+    config: Config, messages: List[Dict[str, Any]], character_bg: Optional[str] = None
+) -> str:
+    """Summarize a conversation using sequential scene-by-scene merging.
+
+    Flow:
+    - Split conversation into scenes
+    - Scene 1 raw text → LLM → initial summary
+    - summary + scene 2 raw text → LLM merge → updated summary
+    - summary + scene 3 raw text → LLM merge → updated summary
+    - ...and so on
+
+    Args:
+        character_bg: Character identity/background text. If None, uses _active_profile.system_prompt.
+    """
+    if character_bg is None and _active_profile:
+        character_bg = _active_profile.system_prompt
+    character_bg = character_bg or ""
+
+    # Filter out initial system prompt, keep system events
+    dialog_messages = []
+    for i, msg in enumerate(messages):
+        if msg.get("role") == "system" and i == 0:
+            continue
+        dialog_messages.append(msg)
+
+    conversation_text = _render_messages_to_text(dialog_messages, for_summary=True)
+    if not conversation_text.strip():
+        return ""
+
+    _summary_logger.info(
+        "conversation rendered: %d chars, %d messages", len(conversation_text), len(dialog_messages)
+    )
+
+    # Short conversation: summarize in one shot
+    if len(conversation_text) <= _SCENE_SPLIT_THRESHOLD:
+        _summary_logger.info("short conversation, summarizing in one shot")
+        prompt = _build_initial_summary_prompt(character_bg, conversation_text)
+        return _call_summary_llm(config, prompt, label="one-shot")
+
+    # Long conversation: split into scenes, batch, and merge
+    scenes = _split_into_scenes(dialog_messages)
+    batches = _batch_scenes(scenes)
+    _summary_logger.info("split into %d scenes, %d batches", len(scenes), len(batches))
+
+    if len(batches) <= 1:
+        _summary_logger.info("single batch, summarizing in one shot")
+        prompt = _build_initial_summary_prompt(character_bg, batches[0] if batches else conversation_text)
+        return _call_summary_llm(config, prompt, label="one-shot-fallback")
+
+    current_summary = ""
+    for idx, batch_text in enumerate(batches, 1):
+        _summary_logger.info("batch %d/%d: %d chars", idx, len(batches), len(batch_text))
+
+        if not current_summary:
+            prompt = _build_initial_summary_prompt(character_bg, batch_text)
+            current_summary = _call_summary_llm(config, prompt, label=f"batch-{idx}/{len(batches)}-init")
+        else:
+            prompt = _build_merge_prompt(character_bg, current_summary, batch_text)
+            current_summary = _call_summary_llm(config, prompt, label=f"batch-{idx}/{len(batches)}-merge")
+
+        _summary_logger.info("summary after batch %d: %d chars", idx, len(current_summary))
+
+    return current_summary
+
+
+def _merge_summary_with_new(
+    config: Config, existing_summary: str, messages: List[Dict[str, Any]],
+    character_bg: Optional[str] = None,
+) -> str:
+    """Merge existing summary with new raw messages via scene-by-scene merging.
+
+    Renders messages to text, splits into scenes, then merges each scene
+    into the existing summary sequentially.
+    """
+    if character_bg is None and _active_profile:
+        character_bg = _active_profile.system_prompt
+    character_bg = character_bg or ""
+
+    conversation_text = _render_messages_to_text(messages, for_summary=True)
+    if not conversation_text.strip():
+        return existing_summary
+
+    _summary_logger.info(
+        "merge_with_new: existing=%d chars, new messages=%d, new text=%d chars",
+        len(existing_summary), len(messages), len(conversation_text),
+    )
+
+    # Split into scenes, batch, and merge
+    scenes = _split_into_scenes(messages)
+    batches = _batch_scenes(scenes)
+    _summary_logger.info("merge_with_new: split into %d scenes, %d batches", len(scenes), len(batches))
+
+    current = existing_summary
+    for idx, batch_text in enumerate(batches, 1):
+        _summary_logger.info("merge batch %d/%d: %d chars", idx, len(batches), len(batch_text))
+        prompt = _build_merge_prompt(character_bg, current, batch_text)
+        current = _call_summary_llm(config, prompt, label=f"merge-batch-{idx}/{len(batches)}")
+        _summary_logger.info("summary after merge batch %d: %d chars", idx, len(current))
+
+    return current
 
 
 def _load_summary_cache() -> Dict[str, Any]:
@@ -948,35 +1107,55 @@ def _load_summary_cache() -> Dict[str, Any]:
     return {}
 
 
-def _save_summary_cache(summarized_files: List[str], summary: str) -> None:
+def _save_summary_cache(
+    summarized_files: List[str],
+    summary: str,
+    partial_files: Optional[List[Dict[str, Any]]] = None,
+) -> None:
     """Save summary cache to history_summary.json."""
     cache_path = _log_dir / _SUMMARY_CACHE_FILE
     try:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload: Dict[str, Any] = {
             "summarized_files": summarized_files,
-            "summary": summary
+            "summary": summary,
         }
+        if partial_files:
+            payload["partial_files"] = partial_files
         cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     except Exception:
         pass
 
 
-def _load_history_with_summaries(client: ChatClient) -> Tuple[List[Dict[str, Any]], str]:
-    """Load latest conversation and summarize older ones with caching."""
+def _load_file_messages(log_file: Path) -> List[Dict[str, Any]]:
+    """Load messages from a log file."""
+    try:
+        data = json.loads(log_file.read_text(encoding="utf-8"))
+        return data.get("messages", [])
+    except Exception:
+        return []
+
+
+def _strip_system_head(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Remove the leading system message (character background) from messages."""
+    if messages and messages[0].get("role") == "system":
+        return messages[1:]
+    return messages
+
+
+def _load_history_with_summaries(config: Config) -> Tuple[List[Dict[str, Any]], str]:
+    """Load latest conversation and summarize older ones with caching.
+
+    Supports partial summarization: the second-newest file may be only partially
+    summarized, with its remaining messages prepended to the conversation context.
+    """
     log_files = _list_log_files()
     if not log_files:
         return [], ""
 
-    # Load latest conversation
-    latest_messages = []
-    try:
-        data = json.loads(log_files[0].read_text(encoding="utf-8"))
-        latest_messages = data.get("messages", [])
-    except Exception:
-        pass
+    # --- Step 1: File classification ---
+    latest_messages = _load_file_messages(log_files[0])
 
-    # Check if latest log exceeds size limit — if so, treat it as old and start fresh
     if _messages_size(latest_messages) > MAX_LOG_SIZE:
         older_files = log_files  # all files become "old", including latest
         latest_messages = []
@@ -985,58 +1164,123 @@ def _load_history_with_summaries(client: ChatClient) -> Tuple[List[Dict[str, Any
     if not older_files:
         return latest_messages, ""
 
-    older_file_names = [f.name for f in older_files]
-
-    # Check cache
+    # --- Step 2: Read cache ---
     cache = _load_summary_cache()
-    cached_files = cache.get("summarized_files", [])
+    cached_summarized = cache.get("summarized_files", [])
+    cached_partial: List[Dict[str, Any]] = cache.get("partial_files", [])
     cached_summary = cache.get("summary", "")
 
-    if cached_files == older_file_names and cached_summary:
-        # Cache is up to date
+    # Build lookup for partial files: filename -> summarized_count
+    partial_lookup: Dict[str, int] = {p["file"]: p["summarized_count"] for p in cached_partial}
+
+    # Check if cache is fully up to date (all older files are either summarized or partial)
+    cached_all = set(cached_summarized) | set(partial_lookup.keys())
+    older_file_names = [f.name for f in older_files]
+    if cached_all == set(older_file_names) and cached_summary and not partial_lookup:
+        # Fully cached, no partial files to process
         return latest_messages, cached_summary
 
-    # Find new files not in cache
-    cached_set = set(cached_files)
-    new_files = [f for f in older_files if f.name not in cached_set]
+    # --- Step 3: Collect unsummarized messages ---
+    unsummarized_messages: List[Dict[str, Any]] = []
+    # Track which messages belong to which file for bookkeeping
+    file_message_ranges: List[Tuple[str, int]] = []  # (filename, message_count_in_unsummarized)
 
-    if not new_files and cached_summary:
-        # Some files were removed but no new ones — just use cached summary
-        _save_summary_cache(older_file_names, cached_summary)
-        return latest_messages, cached_summary
-
-    # Summarize new files
-    new_summaries: List[str] = []
-    for log_file in new_files:
-        try:
-            data = json.loads(log_file.read_text(encoding="utf-8"))
-            messages = data.get("messages", [])
-            if messages:
-                summary = _summarize_conversation(client, messages)
-                if summary:
-                    if len(summary) > MAX_SUMMARY_SIZE:
-                        summary = summary[:MAX_SUMMARY_SIZE]
-                    new_summaries.append(f"[{log_file.stem}]\n{summary}")
-        except Exception:
+    for f in reversed(older_files):  # oldest first for chronological order
+        if f.name in cached_summarized:
             continue
+        all_msgs = _load_file_messages(f)
+        if not all_msgs:
+            continue
+        stripped = _strip_system_head(all_msgs)
+        if f.name in partial_lookup:
+            # Skip already-summarized messages (count includes system msg at index 0)
+            skip = partial_lookup[f.name] - 1  # -1 because we already stripped system
+            if skip > 0:
+                stripped = stripped[skip:]
+        if stripped:
+            unsummarized_messages.extend(stripped)
+            file_message_ranges.append((f.name, len(stripped)))
 
-    # Combine with existing cache
-    if cached_summary and new_summaries:
-        # Incremental update: merge existing summary with new summaries
-        combined_summary = _merge_summary_with_new(client, cached_summary, new_summaries)
-    elif cached_summary:
-        combined_summary = cached_summary
-    elif new_summaries:
-        # No cache, summarize all
-        combined_summary = _summarize_all_summaries(client, new_summaries)
+    if not unsummarized_messages and cached_summary:
+        # Nothing new to process
+        return latest_messages, cached_summary
+
+    # --- Step 4: Trim second-newest file ---
+    # second_newest = older_files[0] (newest among older files)
+    second_newest_name = older_files[0].name
+    need_trim = (
+        not latest_messages
+        or _messages_size(latest_messages) < MAX_LOG_SIZE // 2
+    )
+
+    new_partial_files: List[Dict[str, Any]] = []
+    new_summarized_files = list(cached_summarized)
+
+    if need_trim and file_message_ranges:
+        # Find the second-newest file's messages in unsummarized list
+        last_file, last_count = file_message_ranges[-1]
+        if last_file == second_newest_name and last_count > 1:
+            half = last_count // 2
+            keep_for_summary = last_count - half  # front half stays for summarization
+            context_msgs = unsummarized_messages[-half:]  # back half → context
+            unsummarized_messages = unsummarized_messages[:-half]
+            file_message_ranges[-1] = (last_file, keep_for_summary)
+
+            # Prepend context messages to latest_messages
+            latest_messages = context_msgs + latest_messages
+
+            # Calculate total summarized count for this file
+            prev_count = partial_lookup.get(second_newest_name, 0)
+            if prev_count == 0:
+                # First time: system msg (1) + front half
+                new_count = 1 + keep_for_summary
+            else:
+                new_count = prev_count + keep_for_summary
+            new_partial_files.append({"file": second_newest_name, "summarized_count": new_count})
+            _summary_logger.info(
+                "trim %s: keep %d for summary, %d to context, total_summarized=%d",
+                second_newest_name, keep_for_summary, half, new_count,
+            )
+        else:
+            # No trimming needed (single message or not the second-newest)
+            if second_newest_name not in new_summarized_files:
+                new_summarized_files.append(second_newest_name)
     else:
-        combined_summary = ""
+        # No trim: second-newest fully participates
+        if second_newest_name not in new_summarized_files and file_message_ranges:
+            last_file, _ = file_message_ranges[-1]
+            if last_file == second_newest_name:
+                new_summarized_files.append(second_newest_name)
+
+    # Mark all other processed files as summarized
+    for fname, _ in file_message_ranges:
+        if fname != second_newest_name and fname not in new_summarized_files:
+            new_summarized_files.append(fname)
+
+    # --- Step 5: Summarize ---
+    if not unsummarized_messages:
+        combined_summary = cached_summary
+    elif not cached_summary:
+        _summary_logger.info(
+            "initial summarization: %d unsummarized messages", len(unsummarized_messages)
+        )
+        combined_summary = _summarize_conversation(config, unsummarized_messages)
+    else:
+        _summary_logger.info(
+            "incremental merge: %d unsummarized messages into %d chars summary",
+            len(unsummarized_messages), len(cached_summary),
+        )
+        combined_summary = _merge_summary_with_new(config, cached_summary, unsummarized_messages)
 
     if len(combined_summary) > MAX_SUMMARY_SIZE:
+        _summary_logger.warning(
+            "final summary truncated: %d -> %d chars", len(combined_summary), MAX_SUMMARY_SIZE
+        )
         combined_summary = combined_summary[:MAX_SUMMARY_SIZE]
 
-    # Save cache
+    # --- Step 6: Save cache ---
+    _summary_logger.info("final summary: %d chars", len(combined_summary))
     if combined_summary:
-        _save_summary_cache(older_file_names, combined_summary)
+        _save_summary_cache(new_summarized_files, combined_summary, new_partial_files)
 
     return latest_messages, combined_summary
