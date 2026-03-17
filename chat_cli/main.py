@@ -18,7 +18,7 @@ _summary_logger = logging.getLogger("chat_cli.summary")
 from .chat import ChatSession
 from .client import APIError, ChatClient
 from .config import Config, ConfigError, DEFAULT_CONFIG_PATH, Profile, load_config, load_profile, list_profiles
-from .tools import ToolError, execute_tool, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count
+from .tools import ToolError, execute_tool, get_max_act_calls, handle_act, handle_face2face, handle_separate, init_face_to_face_state, is_face_to_face, list_tool_specs, reset_act_call_count, set_max_act_calls
 
 from prompt_toolkit import prompt as pt_prompt
 from prompt_toolkit.formatted_text import ANSI
@@ -92,6 +92,37 @@ _TS_PATTERN = re.compile(r"\s*<\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?[^>]*>\s*
 def _print_ts(ts: str, use_color: bool) -> None:
     """Print a timestamp line in gray."""
     print(style(f"─────────────────── {ts} ───", GRAY, use_color))
+
+
+_CMD_KEYS = ("face", "sep", "act", "say", "lmt")
+_CMD_PATTERN = re.compile(
+    r'\b(' + '|'.join(_CMD_KEYS) + r')\s*:\s*',
+    re.IGNORECASE,
+)
+
+
+def _parse_commands(text: str) -> Dict[str, str]:
+    """Parse command prefixes from input text in any order.
+
+    Returns dict with command names as keys and their values.
+    Non-command text is stored under '_text'.
+    """
+    result: Dict[str, str] = {}
+    matches = list(_CMD_PATTERN.finditer(text))
+    if not matches:
+        result["_text"] = text.strip()
+        return result
+    # Text before first command
+    before = text[:matches[0].start()].strip()
+    if before:
+        result["_text"] = before
+    for i, m in enumerate(matches):
+        key = m.group(1).lower()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        val = text[start:end].strip()
+        result[key] = val
+    return result
 
 
 def _strip_ai_timestamp(text: str) -> str:
@@ -237,6 +268,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             info_entries.append(("History", f"summary loaded ({len(history_summary)} chars)"))
         if is_face_to_face():
             info_entries.append(("Status", "见面中"))
+        info_entries.append(("Act limit", f"lmt: N (当前 {get_max_act_calls()})"))
         info_entries.append(("Exit", "/quit /exit /q"))
         _print_info_box(info_entries, use_color)
 
@@ -272,40 +304,57 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             # Reset act call count for new user turn
             reset_act_call_count()
 
-            # Check for special commands
-            if trimmed.lower().startswith("face:"):
-                scene = trimmed[5:].strip()
-                system_msg = handle_face2face(scene)
-                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
-                _print_system_event(system_msg, use_color)
-            elif trimmed.lower().startswith("sep:"):
-                scene = trimmed[4:].strip()
-                system_msg = handle_separate(scene)
-                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
-                _print_system_event(system_msg, use_color)
-            elif trimmed.lower().startswith("act:"):
-                # Parse act and optional say
-                rest = trimmed[4:].strip()
-                speech = ""
-                if " say:" in rest.lower():
-                    idx = rest.lower().find(" say:")
-                    action = rest[:idx].strip()
-                    speech = rest[idx + 5:].strip()
-                else:
-                    action = rest
+            # Parse commands (any order): face: sep: act: say: lmt:
+            cmds = _parse_commands(trimmed)
+            skip = False
 
-                msg, valid = handle_act(action, speech)
+            # lmt: (setting, no message)
+            if "lmt" in cmds:
+                val = cmds["lmt"]
+                try:
+                    n = int(val)
+                    if n < 1:
+                        raise ValueError
+                    set_max_act_calls(n)
+                    print(style(f"[act 次数限制已设为 {n}]", TOOL_COLOR, use_color))
+                except ValueError:
+                    print(style("[提示] lmt: 须为正整数", TOOL_COLOR, use_color))
+                    skip = True
+
+            if not skip and "face" in cmds:
+                system_msg = handle_face2face(cmds["face"])
+                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
+                _print_system_event(system_msg, use_color)
+            elif not skip and "sep" in cmds:
+                system_msg = handle_separate(cmds["sep"])
+                session.add_message({"role": "system", "content": system_msg, "ts": _now_ts()})
+                _print_system_event(system_msg, use_color)
+
+            if not skip and "act" in cmds:
+                msg, valid = handle_act(cmds.get("act", ""), cmds.get("say", ""))
                 if valid:
                     session.add_message({"role": "user", "content": msg, "ts": _now_ts()})
                 else:
                     print(style(msg, TOOL_COLOR, use_color))
-                    continue
-            elif "act:" in trimmed.lower():
-                # act: not at the start of message
-                print(style("[提示] act: 必须在消息开头使用", TOOL_COLOR, use_color))
+                    skip = True
+
+            if skip:
                 continue
-            else:
-                session.add_message({"role": "user", "content": user_input, "ts": _now_ts()})
+
+            has_cmd = any(k in cmds for k in ("face", "sep", "act", "lmt"))
+            if not has_cmd:
+                # Plain text with no commands
+                if cmds.get("_text"):
+                    session.add_message({"role": "user", "content": user_input, "ts": _now_ts()})
+                else:
+                    continue
+            elif "_text" in cmds and cmds["_text"] and "act" not in cmds:
+                # Commands + leftover text: send text as user message too
+                session.add_message({"role": "user", "content": cmds["_text"], "ts": _now_ts()})
+
+            # If only lmt: with no other action, skip LLM call
+            if has_cmd and not any(k in cmds for k in ("face", "sep", "act", "_text")):
+                continue
 
             try:
                 _handle_assistant_interaction(session, client, tool_specs, use_color)
@@ -356,7 +405,7 @@ def _handle_assistant_interaction(
         if use_color:
             print(AI_COLOR, end="", flush=True)
 
-        assistant_reply, tool_calls, ended_nl = _stream_response(session, client, tool_specs, use_color)
+        display_text, tool_calls, ended_nl, raw_content = _stream_response(session, client, tool_specs, use_color)
 
         if use_color:
             print(RESET, end="", flush=True)
@@ -364,18 +413,88 @@ def _handle_assistant_interaction(
             print()
 
         ts = _now_ts()
-        clean_reply = _strip_ai_timestamp(assistant_reply)
+        # Clean timestamps from content before storing
+        store_content = ""
+        if raw_content:
+            store_content = _strip_ai_timestamp(raw_content)
+            # Also strip timestamp inside JSON text field
+            if store_content.lstrip().startswith("{"):
+                try:
+                    parsed = json.loads(store_content)
+                except (json.JSONDecodeError, ValueError):
+                    # Fix literal newlines inside JSON string values
+                    try:
+                        parsed = json.loads(store_content.replace("\n", "\\n"))
+                        store_content = json.dumps(parsed, ensure_ascii=False)
+                    except (json.JSONDecodeError, ValueError):
+                        parsed = None
+                if parsed and "text" in parsed:
+                    cleaned_text = _strip_ai_timestamp(parsed["text"])
+                    if cleaned_text != parsed["text"]:
+                        parsed["text"] = cleaned_text
+                        store_content = json.dumps(parsed, ensure_ascii=False)
+        # Detect invalid responses (not valid JSON with "text" field)
+        if not tool_calls and _is_invalid_response(store_content):
+            print(style("  [无效响应，重试中...]", TOOL_COLOR, use_color))
+            continue
+
         if tool_calls:
             msg: Dict[str, Any] = {"role": "assistant", "tool_calls": tool_calls, "ts": ts}
-            if clean_reply:
-                msg["content"] = clean_reply
+            if store_content:
+                msg["content"] = store_content
+                _print_ts(ts, use_color)
             session.add_message(msg)
             awaiting_final = _process_tool_calls(session, tool_calls, use_color)
         else:
-            if clean_reply:
-                session.add_message({"role": "assistant", "content": clean_reply, "ts": ts})
+            if store_content:
+                session.add_message({"role": "assistant", "content": store_content, "ts": ts})
                 _print_ts(ts, use_color)
             awaiting_final = False
+
+
+def _is_invalid_response(raw_content: str) -> bool:
+    """Check if response is invalid (not valid JSON with 'text' field)."""
+    stripped = raw_content.strip()
+    if not stripped:
+        return True
+    try:
+        parsed = json.loads(stripped)
+        return "text" not in parsed
+    except (json.JSONDecodeError, ValueError):
+        # Try fixing literal newlines
+        try:
+            parsed = json.loads(stripped.replace("\n", "\\n"))
+            return "text" not in parsed
+        except (json.JSONDecodeError, ValueError):
+            return True
+
+
+_JSON_TEXT_FIELD_RE = re.compile(r'"text"\s*:\s*"')
+_JSON_ESCAPE_MAP = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "/": "/", "b": "\b", "f": "\f"}
+
+
+def _decode_json_string_partial(raw: str) -> Tuple[str, bool]:
+    """Decode a partial JSON string value (without surrounding quotes).
+
+    Returns (decoded_text, complete) where complete is True if the closing
+    quote was found.
+    """
+    decoded: List[str] = []
+    i = 0
+    while i < len(raw):
+        ch = raw[i]
+        if ch == '"':
+            return "".join(decoded), True
+        if ch == '\\':
+            if i + 1 >= len(raw):
+                break  # incomplete escape, wait for more data
+            next_ch = raw[i + 1]
+            decoded.append(_JSON_ESCAPE_MAP.get(next_ch, next_ch))
+            i += 2
+        else:
+            decoded.append(ch)
+            i += 1
+    return "".join(decoded), False
 
 
 def _stream_response(
@@ -383,37 +502,80 @@ def _stream_response(
     client: ChatClient,
     tool_specs: List[Dict[str, Any]],
     use_color: bool = True,
-) -> Tuple[str, List[Dict[str, Any]], bool]:
-    """Stream response and return (full_text, tool_calls, ended_with_newline)."""
-    assistant_chunks: List[str] = []
+) -> Tuple[str, List[Dict[str, Any]], bool, str]:
+    """Stream response and return (text, tool_calls, ended_with_newline, think_text)."""
     collected_tool_calls: List[Dict[str, Any]] = []
-    # Buffer to detect and suppress trailing timestamp
-    buffer = ""
+    full_content = ""
+    text_field_start = -1  # position after opening quote of "text" value
+    displayed_len = 0  # decoded chars already printed
+    display_buffer = ""  # held-back text for timestamp detection
     last_printed = ""
 
-    for event in client.stream_chat(session.messages, tools=tool_specs):
+    for event in client.stream_chat(
+        session.messages, tools=tool_specs,
+        response_format={"type": "json_object"},
+    ):
         event_type = event.get("type")
         if event_type == "content":
-            text = event.get("text", "")
-            assistant_chunks.append(text)
-            buffer += text
-            safe, held = _split_safe_output(buffer)
-            if safe:
-                print(safe, end="", flush=True)
-                last_printed = safe
-                buffer = held
+            full_content += event.get("text", "")
+            # Detect text field start
+            if text_field_start < 0:
+                m = _JSON_TEXT_FIELD_RE.search(full_content)
+                if m:
+                    text_field_start = m.end()
+            # Stream-decode text field incrementally
+            if text_field_start >= 0:
+                raw = full_content[text_field_start:]
+                decoded, _complete = _decode_json_string_partial(raw)
+                new_text = decoded[displayed_len:]
+                if new_text:
+                    display_buffer += new_text
+                    displayed_len = len(decoded)
+                    safe, display_buffer = _split_safe_output(display_buffer)
+                    if safe:
+                        print(safe, end="", flush=True)
+                        last_printed = safe
         elif event_type == "tool_call":
             collected_tool_calls.append(event["tool_call"])
 
-    # Flush remaining buffer, stripping any timestamp and trailing newlines
-    if buffer:
-        clean = _strip_ai_timestamp(buffer).rstrip("\n")
+    # Parse final result — strip timestamp before JSON parsing
+    think_text = ""
+    final_text = ""
+    json_parsed = False
+    cleaned_content = _strip_ai_timestamp(full_content)
+    try:
+        parsed = json.loads(cleaned_content)
+        think_text = parsed.get("think", "")
+        final_text = parsed.get("text", "")
+        json_parsed = True
+    except (json.JSONDecodeError, ValueError):
+        # Try fixing literal newlines inside JSON string values
+        try:
+            parsed = json.loads(cleaned_content.replace("\n", "\\n"))
+            think_text = parsed.get("think", "")
+            final_text = parsed.get("text", "")
+            json_parsed = True
+        except (json.JSONDecodeError, ValueError):
+            # Fallback: treat as plain text
+            final_text = cleaned_content
+
+    final_text = _strip_ai_timestamp(final_text)
+
+    # Flush display_buffer and any remaining undisplayed text
+    # Only append undisplayed tail when JSON parsed successfully —
+    # otherwise final_text is raw content and displayed_len is from
+    # the text-field decoder, causing JSON structure to leak.
+    remaining = display_buffer
+    if json_parsed and final_text and displayed_len < len(final_text):
+        remaining += final_text[displayed_len:]
+    if remaining:
+        clean = _strip_ai_timestamp(remaining).rstrip("\n")
         if clean:
             print(clean, end="", flush=True)
             last_printed = clean
 
     ended_with_newline = last_printed.endswith("\n")
-    return "".join(assistant_chunks), collected_tool_calls, ended_with_newline
+    return final_text, collected_tool_calls, ended_with_newline, full_content
 
 
 def _split_safe_output(buffer: str) -> Tuple[str, str]:
@@ -472,10 +634,10 @@ def _print_act_result(result_json: str, use_color: bool) -> None:
 
     for line in act_result.split("\n"):
         if line.startswith("[动作] "):
-            action = line[5:]
+            action = line[5:].replace("\\n", "\n")
             print(f"{style(f'{_ai_name()} do>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
         elif line.startswith("[说话] "):
-            speech = line[5:]
+            speech = line[5:].replace("\\n", "\n")
             print(f"{style(f'{_ai_name()} say>', AI_COLOR, use_color)} {style(speech, AI_COLOR, use_color)}")
 
 
@@ -508,14 +670,17 @@ def _get_tool_name_for_result(tool_msg: Dict[str, Any], messages: List[Dict[str,
     return ""
 
 
-def _print_act_call(arguments_json: str, use_color: bool) -> None:
+def _print_act_call(arguments_json: str, use_color: bool, show_thinking: bool = False) -> None:
     """Print act tool call in name do> / name say> format from call arguments."""
     try:
         args = json.loads(arguments_json)
     except (json.JSONDecodeError, AttributeError):
         return
-    action = args.get("action", "")
-    speech = args.get("speech", "")
+    think = args.get("think", "")
+    action = args.get("action", "").replace("\\n", "\n")
+    speech = args.get("speech", "").replace("\\n", "\n")
+    if show_thinking and think:
+        print(f"[thinking] {think}")
     if action:
         print(f"{style(f'{_ai_name()} do>', ACTION_COLOR, use_color)} {style(action, ACTION_COLOR, use_color)}")
     if speech:
@@ -610,7 +775,7 @@ def _print_title(use_color: bool) -> None:
     print()
 
 
-def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separator: bool = True) -> None:
+def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separator: bool = True, show_thinking: bool = False) -> None:
     """Print previous conversation messages so the user can see chat history."""
     for msg in messages:
         role = msg.get("role", "")
@@ -628,6 +793,30 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
             if ts:
                 _print_ts(ts, use_color)
         elif role == "assistant":
+            # Parse JSON content: {"think": "...", "text": "..."}
+            display_content = content
+            think_content = ""
+            if content.lstrip().startswith("{"):
+                try:
+                    parsed = json.loads(content)
+                    if "text" in parsed:
+                        display_content = parsed["text"]
+                        think_content = parsed.get("think", "")
+                except (json.JSONDecodeError, ValueError):
+                    # Try fixing literal newlines inside JSON string values
+                    try:
+                        parsed = json.loads(content.replace("\n", "\\n"))
+                        if "text" in parsed:
+                            display_content = parsed["text"]
+                            think_content = parsed.get("think", "")
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            # Also check legacy reasoning_content field
+            if not think_content:
+                think_content = msg.get("reasoning_content", "")
+            if show_thinking and think_content:
+                print(f"[thinking] {think_content}")
+            content = display_content
             if content:
                 print(f"{style(_ai_label(), AI_COLOR, use_color)} {style(content, AI_COLOR, use_color)}")
             if "tool_calls" in msg:
@@ -636,15 +825,14 @@ def _replay_history(messages: List[Dict[str, Any]], use_color: bool, show_separa
                     name = func.get("name", "")
                     arguments = func.get("arguments", "")
                     if name == "act":
-                        _print_act_call(arguments, use_color)
+                        _print_act_call(arguments, use_color, show_thinking=show_thinking)
                     elif name == "noop":
                         print(f"{style(_ai_label(), DIM + AI_COLOR, use_color)} {style('...', DIM + AI_COLOR, use_color)}")
                     elif name == "check_the_time":
                         pass  # result will be shown in tool message
                     else:
                         print(style(f"[tool-call] {name}({arguments})", TOOL_COLOR, use_color))
-            elif ts:
-                # Show timestamp for final assistant message (no tool_calls)
+            if ts:
                 _print_ts(ts, use_color)
         elif role == "tool":
             tool_name = _get_tool_name_for_result(msg, messages)
@@ -693,7 +881,7 @@ def _write_log_to_path(messages: List[Dict[str, Any]], path: Path) -> None:
         buf = io.StringIO()
         old_stdout = sys.stdout
         sys.stdout = buf
-        _replay_history(messages, use_color=False, show_separator=False)
+        _replay_history(messages, use_color=False, show_separator=False, show_thinking=True)
         sys.stdout = old_stdout
         readable_path.write_text(buf.getvalue(), encoding="utf-8")
     except Exception as exc:  # pragma: no cover - best-effort
@@ -811,7 +999,7 @@ def _render_messages_to_text(messages: List[Dict[str, Any]], for_summary: bool =
     old_stdout = sys.stdout
     sys.stdout = buf
     try:
-        _replay_history(messages, use_color=False, show_separator=False)
+        _replay_history(messages, use_color=False, show_separator=False, show_thinking=True)
     finally:
         sys.stdout = old_stdout
     text = buf.getvalue()

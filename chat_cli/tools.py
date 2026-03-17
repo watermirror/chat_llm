@@ -55,6 +55,10 @@ _ACT_TOOL = Tool(
     parameters={
         "type": "object",
         "properties": {
+            "think": {
+                "type": "string",
+                "description": "可选，你此刻的内心想法",
+            },
             "action": {
                 "type": "string",
                 "description": "你要做的动作，比如 '轻轻握住他的手'",
@@ -135,6 +139,17 @@ def reset_act_call_count() -> None:
     """Reset act call count when user sends a new message."""
     global _act_call_count
     _act_call_count = 0
+
+
+def set_max_act_calls(n: int) -> None:
+    """Set the maximum number of act calls per turn."""
+    global MAX_ACT_CALLS_PER_TURN
+    MAX_ACT_CALLS_PER_TURN = n
+
+
+def get_max_act_calls() -> int:
+    """Return the current max act calls per turn."""
+    return MAX_ACT_CALLS_PER_TURN
 
 
 def list_tool_specs() -> List[Dict[str, Any]]:
@@ -243,13 +258,17 @@ def _execute_act(arguments: Dict[str, Any]) -> str:
     if _act_call_count >= MAX_ACT_CALLS_PER_TURN:
         return json.dumps({"act_overflow": True})
 
+    think = arguments.get("think")
     action = arguments.get("action")
     if not action or not isinstance(action, str):
         raise ToolError("'action' is required and must be a string")
+    action = action.replace("\\n", "\n")
 
     speech = arguments.get("speech")
     if speech is not None and not isinstance(speech, str):
         raise ToolError("'speech' must be a string if provided")
+    if speech:
+        speech = speech.replace("\\n", "\n")
 
     _act_call_count += 1
 
@@ -258,7 +277,10 @@ def _execute_act(arguments: Dict[str, Any]) -> str:
     else:
         result = f"[动作] {action}"
 
-    return json.dumps({"act_result": result}, ensure_ascii=False)
+    ret: Dict[str, Any] = {"act_result": result}
+    if think:
+        ret["think"] = think
+    return json.dumps(ret, ensure_ascii=False)
 
 
 def handle_face2face(scene: str) -> str:
