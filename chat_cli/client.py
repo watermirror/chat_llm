@@ -97,12 +97,13 @@ class ChatClient:
         *,
         tools: Optional[List[Dict[str, Any]]] = None,
         max_tokens: Optional[int] = None,
+        response_format: Optional[Dict[str, str]] = None,
     ) -> Iterator[Dict[str, Any]]:
         # Embed 'ts' field into message content so the API can see timestamps
         api_messages = []
         for m in messages:
             ts = m.get("ts")
-            msg = {k: v for k, v in m.items() if k != "ts"}
+            msg = {k: v for k, v in m.items() if k not in ("ts", "reasoning_content")}
             if ts and "tool_calls" not in msg and msg.get("role") != "tool":
                 existing = msg.get("content", "")
                 if existing:
@@ -118,6 +119,9 @@ class ChatClient:
 
         if max_tokens is not None:
             request["max_tokens"] = max_tokens
+
+        if response_format is not None:
+            request["response_format"] = response_format
 
         prepared_tools = self._prepare_tools(tools)
         if prepared_tools:
@@ -146,6 +150,10 @@ class ChatClient:
                     delta = getattr(choice, "delta", None)
                     if delta is None:
                         continue
+
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if reasoning:
+                        yield {"type": "reasoning", "text": reasoning}
 
                     content = getattr(delta, "content", None)
                     if content:
@@ -184,6 +192,10 @@ class ChatClient:
             message = getattr(choice, "message", None)
             if message is None:
                 continue
+
+            reasoning = getattr(message, "reasoning_content", None)
+            if reasoning:
+                yield {"type": "reasoning", "text": reasoning}
 
             content = getattr(message, "content", None)
             if content:
